@@ -316,7 +316,7 @@ func (m *mcManager) recomputeOwnership(parent context.Context) {
 			}
 			e.cancel = nil
 			e.started = false
-			e.nextTry = time.Time{} // reset throttle so new owner can grab quickly
+			e.nextTry = time.Time{}
 			m.GetLogger().Info("ownership stop", "cluster", name, "peer", self.ID)
 		}
 	}
