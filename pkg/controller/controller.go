@@ -116,20 +116,18 @@ func (c *mcController[request]) Engage(ctx context.Context, name string, cl clus
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-    // Check if we already have this cluster engaged with the SAME context
-    if old, ok := c.clusters[name]; ok {
-        // If the context is different or cancelled, we need to re-engage
-        select {
-        case <-old.ctx.Done():
-            // Old context is cancelled, need to re-engage
-            delete(c.clusters, name)
-        default:
-            if old.cluster == cl {
-                // Same cluster, same active context, nothing to do
-                return nil
-            }
-        }
-    }
+	// Check if we already have this cluster engaged with the SAME context
+	if old, ok := c.clusters[name]; ok {
+		if old.cluster == cl && old.ctx.Err() == nil {
+			// Same impl, engagement still live → nothing to do
+			return nil
+		}
+		// Re-engage: either old ctx is done, or impl changed. Stop the old one if still live.
+		if old.ctx.Err() == nil {
+			old.cancel()
+		}
+		delete(c.clusters, name)
+	}
 
 	engCtx, cancel := context.WithCancel(ctx)
 
