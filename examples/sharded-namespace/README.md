@@ -132,8 +132,3 @@ kubectl delete -k examples/sharded-namespace/manifests
 kind delete cluster --name mcr-demo
 
 ```
-
-## Notes
-
-- This example assumes the `peers` and `sharder` code we wrote is integrated and `mcmanager.Configure` hooks it up (defaults: HRW + Lease registry; hostname as peer ID).
-- If your repo uses a different module path, the Dockerfile build context may need minor tweaking—otherwise it compiles against your local packages.
