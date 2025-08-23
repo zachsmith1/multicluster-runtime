@@ -91,7 +91,7 @@ func NewTypedUnmanaged[request mcreconcile.ClusterAware[request]](name string, m
 	}
 	return &mcController[request]{
 		TypedController: c,
-		clusters:        make(map[string]engagedCluster),
+		clusters:        make(map[string]*engagedCluster),
 	}, nil
 }
 
@@ -101,28 +101,41 @@ type mcController[request mcreconcile.ClusterAware[request]] struct {
 	controller.TypedController[request]
 
 	lock     sync.Mutex
-	clusters map[string]engagedCluster
+	clusters map[string]*engagedCluster
 	sources  []mcsource.TypedSource[client.Object, request]
 }
 
 type engagedCluster struct {
 	name    string
 	cluster cluster.Cluster
+	ctx     context.Context
+	cancel  context.CancelFunc
 }
 
 func (c *mcController[request]) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	if old, ok := c.clusters[name]; ok && old.cluster == cl {
-		return nil
-	}
+    // Check if we already have this cluster engaged with the SAME context
+    if old, ok := c.clusters[name]; ok {
+        // If the context is different or cancelled, we need to re-engage
+        select {
+        case <-old.ctx.Done():
+            // Old context is cancelled, need to re-engage
+            delete(c.clusters, name)
+        default:
+            if old.cluster == cl {
+                // Same cluster, same active context, nothing to do
+                return nil
+            }
+        }
+    }
 
-	ctx, cancel := context.WithCancel(ctx) //nolint:govet // cancel is called in the error case only.
+	engCtx, cancel := context.WithCancel(ctx)
 
 	// pass through in case the controller itself is cluster aware
 	if ctrl, ok := c.TypedController.(multicluster.Aware); ok {
-		if err := ctrl.Engage(ctx, name, cl); err != nil {
+		if err := ctrl.Engage(engCtx, name, cl); err != nil {
 			cancel()
 			return err
 		}
@@ -135,24 +148,28 @@ func (c *mcController[request]) Engage(ctx context.Context, name string, cl clus
 			cancel()
 			return fmt.Errorf("failed to engage for cluster %q: %w", name, err)
 		}
-		if err := c.TypedController.Watch(startWithinContext[request](ctx, src)); err != nil {
+		if err := c.TypedController.Watch(startWithinContext[request](engCtx, src)); err != nil {
 			cancel()
 			return fmt.Errorf("failed to watch for cluster %q: %w", name, err)
 		}
 	}
 
-	ec := engagedCluster{
+	ec := &engagedCluster{
 		name:    name,
 		cluster: cl,
+		ctx:     engCtx,
+		cancel:  cancel,
 	}
 	c.clusters[name] = ec
-	go func() {
+	go func(ctx context.Context, key string, token *engagedCluster) {
+		<-ctx.Done()
 		c.lock.Lock()
 		defer c.lock.Unlock()
-		if c.clusters[name] == ec {
-			delete(c.clusters, name)
+		if cur, ok := c.clusters[key]; ok && cur == token {
+			delete(c.clusters, key)
 		}
-	}()
+		// note: cancel() is driven by parent; no need to call here
+	}(engCtx, name, ec)
 
 	return nil //nolint:govet // cancel is called in the error case only.
 }
@@ -161,16 +178,12 @@ func (c *mcController[request]) MultiClusterWatch(src mcsource.TypedSource[clien
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:govet // cancel is called in the error case only.
-
 	for name, eng := range c.clusters {
 		src, err := src.ForCluster(name, eng.cluster)
 		if err != nil {
-			cancel()
 			return fmt.Errorf("failed to engage for cluster %q: %w", name, err)
 		}
-		if err := c.TypedController.Watch(startWithinContext[request](ctx, src)); err != nil {
-			cancel()
+		if err := c.TypedController.Watch(startWithinContext[request](eng.ctx, src)); err != nil {
 			return fmt.Errorf("failed to watch for cluster %q: %w", name, err)
 		}
 	}
