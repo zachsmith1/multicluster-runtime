@@ -23,10 +23,12 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/peers"
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
@@ -93,7 +95,7 @@ type ownershipEngine struct {
 	// sharder decides “shouldOwn” given clusterID, peers, and self (e.g., HRW).
 	sharder sharder.Sharder
 	// peers provides a live membership snapshot for sharding decisions.
-	peers peerRegistry
+	peers peers.Registry
 	// self is this process’s identity/weight as known by the peer registry.
 	self sharder.PeerInfo
 	// cfg holds all ownership/fencing configuration.
@@ -131,22 +133,8 @@ type engagement struct {
 	nextTry time.Time
 }
 
-// peerRegistry abstracts peer discovery/membership for sharding decisions.
-// Self returns this process identity; Snapshot returns the current peer set;
-// Run keeps the registry fresh until ctx is cancelled.
-type peerRegistry interface {
-	// Self returns this process’s identity and weight as known by the registry.
-	Self() sharder.PeerInfo
-	// Snapshot returns the current set of known peers. The slice order is arbitrary
-	// and the returned data should be treated as read-only by callers.
-	Snapshot() []sharder.PeerInfo
-	// Run keeps membership fresh until ctx is cancelled or an error occurs.
-	// It should block, periodically updating internal state for Self/Snapshot.
-	Run(ctx context.Context) error
-}
-
 // newOwnershipEngine wires an engine with its dependencies and initial config.
-func newOwnershipEngine(kube client.Client, log logr.Logger, shard sharder.Sharder, peers peerRegistry, self sharder.PeerInfo, cfg OwnershipConfig) *ownershipEngine {
+func newOwnershipEngine(kube client.Client, log logr.Logger, shard sharder.Sharder, peers peers.Registry, self sharder.PeerInfo, cfg OwnershipConfig) *ownershipEngine {
 	return &ownershipEngine{
 		kube: kube, log: log,
 		sharder: shard, peers: peers, self: self, cfg: cfg,
@@ -251,7 +239,7 @@ func (e *ownershipEngine) Engage(parent context.Context, name string, cl cluster
 	if doRecompute {
 		go e.recompute(parent)
 	}
-	
+
 	return nil
 }
 
@@ -344,7 +332,7 @@ func (e *ownershipEngine) startForCluster(ctx context.Context, name string, cl c
 			e.log.Error(err, "failed to engage", "cluster", name)
 			// best-effort: cancel + mark stopped so next tick can retry
 			e.mu.Lock()
-			if engm := e.engaged[name]; e != nil && engm.cancel != nil {
+			if engm := e.engaged[name]; engm != nil && engm.cancel != nil {
 				engm.cancel()
 				engm.started = false
 			}

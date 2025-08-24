@@ -24,10 +24,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
+
 	coordv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
+
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
@@ -42,10 +45,14 @@ const (
 	defaultWeight = uint32(1)
 )
 
-// Registry abstracts peer discovery for sharding.
+// Registry provides peer membership for sharding decisions.
 type Registry interface {
+	// Self returns this process's identity and weight.
 	Self() sharder.PeerInfo
+	// Snapshot returns the current set of live peers. Treat as read-only.
 	Snapshot() []sharder.PeerInfo
+	// Run blocks, periodically renewing our Lease and refreshing peer membership
+	// until ctx is cancelled or an error occurs.
 	Run(ctx context.Context) error
 }
 
@@ -59,14 +66,19 @@ type leaseRegistry struct {
 
 	ttl   time.Duration
 	renew time.Duration
+
+	log logr.Logger
 }
 
-// NewLeaseRegistry creates a Registry using coordination.k8s.io Leases.
-// ns          : namespace where peer Leases live (e.g., "kube-system")
-// namePrefix  : common prefix for Lease names (e.g., "mcr-peer")
-// selfID      : this process identity (defaults to hostname if empty)
-// weight      : optional weight for HRW (defaults to 1 if 0)
-func NewLeaseRegistry(cli crclient.Client, ns, namePrefix string, selfID string, weight uint32) Registry {
+// NewLeaseRegistry constructs a Lease-based Registry.
+//
+// Params:
+//   - ns: namespace where peer Leases live (e.g. "kube-system")
+//   - namePrefix: Lease name prefix (e.g. "mcr-peer")
+//   - selfID: this process ID (defaults to os.Hostname() if empty)
+//   - weight: relative capacity (0 treated as 1)
+//   - log: logger; use logr.Discard() to silence
+func NewLeaseRegistry(cli crclient.Client, ns, namePrefix string, selfID string, weight uint32, log logr.Logger) Registry {
 	if selfID == "" {
 		if hn, _ := os.Hostname(); hn != "" {
 			selfID = hn
@@ -85,6 +97,7 @@ func NewLeaseRegistry(cli crclient.Client, ns, namePrefix string, selfID string,
 		peers:      map[string]sharder.PeerInfo{},
 		ttl:        30 * time.Second,
 		renew:      10 * time.Second,
+		log:        log.WithName("lease-registry").WithValues("ns", ns, "prefix", namePrefix, "selfID", selfID, "weight", weight),
 	}
 }
 
@@ -101,6 +114,8 @@ func (r *leaseRegistry) Snapshot() []sharder.PeerInfo {
 }
 
 func (r *leaseRegistry) Run(ctx context.Context) error {
+	r.log.Info("peer registry starting", "ns", r.ns, "prefix", r.namePrefix, "self", r.self.ID)
+
 	// Tick frequently enough to renew well within ttl.
 	t := time.NewTicker(r.renew)
 	defer t.Stop()
@@ -108,10 +123,10 @@ func (r *leaseRegistry) Run(ctx context.Context) error {
 	for {
 		// Do one pass immediately so we publish our presence promptly.
 		if err := r.renewSelfLease(ctx); err != nil && ctx.Err() == nil {
-			// Non-fatal; we'll try again on next tick.
+			r.log.V(1).Info("renewSelfLease failed; will retry", "err", err)
 		}
 		if err := r.refreshPeers(ctx); err != nil && ctx.Err() == nil {
-			// Non-fatal; we'll try again on next tick.
+			r.log.V(1).Info("refreshPeers failed; will retry", "err", err)
 		}
 
 		select {

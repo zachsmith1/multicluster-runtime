@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/go-logr/logr"
 	"golang.org/x/sync/errgroup"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/klog/v2"
+
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -31,13 +31,13 @@ func main() {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	if err := run(ctx, log); err != nil {
+	if err := run(ctx); err != nil {
 		log.Error(err, "exiting")
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, log logr.Logger) error {
+func run(ctx context.Context) error {
 	// use in-cluster config; fall back to default loading rules for local runs
 	cfg, err := ctrl.GetConfig()
 	if err != nil {

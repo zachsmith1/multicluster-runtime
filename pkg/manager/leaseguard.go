@@ -24,6 +24,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -54,12 +55,12 @@ import (
 // RBAC: the caller’s client must be allowed to get/list/watch/create/update/patch
 // Leases in namespace `ns`.
 type leaseGuard struct {
-	c       client.Client
-	ns, nm  string
-	id      string
-	ldur    time.Duration // lease duration
-	renew   time.Duration // renew period
-	onLost  func()        // callback when we lose the lease
+	c      client.Client
+	ns, nm string
+	id     string
+	ldur   time.Duration // lease duration
+	renew  time.Duration // renew period
+	onLost func()        // callback when we lose the lease
 
 	held   bool
 	cancel context.CancelFunc

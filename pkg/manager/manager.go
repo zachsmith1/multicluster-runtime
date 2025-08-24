@@ -152,7 +152,7 @@ func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Mana
 		PeerPrefix: "mcr-peer", PeerWeight: 1, Probe: 5 * time.Second, Rehash: 15 * time.Second,
 	}
 
-	pr := peers.NewLeaseRegistry(mgr.GetClient(), cfg.FenceNS, cfg.PeerPrefix, "", cfg.PeerWeight)
+	pr := peers.NewLeaseRegistry(mgr.GetClient(), cfg.FenceNS, cfg.PeerPrefix, "", cfg.PeerWeight, mgr.GetLogger())
 	self := pr.Self()
 
 	eng := newOwnershipEngine(

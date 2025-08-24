@@ -169,7 +169,7 @@ func (c *mcController[request]) Engage(ctx context.Context, name string, cl clus
 		// note: cancel() is driven by parent; no need to call here
 	}(engCtx, name, ec)
 
-	return nil //nolint:govet // cancel is called in the error case only.
+	return nil
 }
 
 func (c *mcController[request]) MultiClusterWatch(src mcsource.TypedSource[client.Object, request]) error {
@@ -188,7 +188,7 @@ func (c *mcController[request]) MultiClusterWatch(src mcsource.TypedSource[clien
 
 	c.sources = append(c.sources, src)
 
-	return nil //nolint:govet // cancel is called in the error case only.
+	return nil
 }
 
 func startWithinContext[request mcreconcile.ClusterAware[request]](ctx context.Context, src source.TypedSource[request]) source.TypedSource[request] {
