@@ -1,3 +1,16 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    http://www.apache.org/licenses/LICENSE-2.0
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package source
 
 import (
@@ -22,43 +35,43 @@ import (
 )
 
 // Kind creates a KindSource with the given cache provider.
-func Kind[O client.Object](
-	obj O,
-	hf mchandler.TypedEventHandlerFunc[O, mcreconcile.Request],
-	preds ...predicate.TypedPredicate[O],
-) SyncingSource[O] {
-	return TypedKind[O, mcreconcile.Request](obj, hf, preds...)
+func Kind[object client.Object](
+	obj object,
+	handler mchandler.TypedEventHandlerFunc[object, mcreconcile.Request],
+	predicates ...predicate.TypedPredicate[object],
+) SyncingSource[object] {
+	return TypedKind[object, mcreconcile.Request](obj, handler, predicates...)
 }
 
 // TypedKind creates a KindSource with the given cache provider.
-func TypedKind[O client.Object, R mcreconcile.ClusterAware[R]](
-	obj O,
-	hf mchandler.TypedEventHandlerFunc[O, R],
-	preds ...predicate.TypedPredicate[O],
-) TypedSyncingSource[O, R] {
-	return &kind[O, R]{
+func TypedKind[object client.Object, request mcreconcile.ClusterAware[request]](
+	obj object,
+	handler mchandler.TypedEventHandlerFunc[object, request],
+	predicates ...predicate.TypedPredicate[object],
+) TypedSyncingSource[object, request] {
+	return &kind[object, request]{
 		obj:        obj,
-		handler:    hf,
-		predicates: preds,
-		project:    func(_ cluster.Cluster, o O) (O, error) { return o, nil },
+		handler:    handler,
+		predicates: predicates,
+		project:    func(_ cluster.Cluster, o object) (object, error) { return o, nil },
 		resync:     0, // no periodic resync by default
 	}
 }
 
-type kind[O client.Object, R mcreconcile.ClusterAware[R]] struct {
-	obj        O
-	handler    mchandler.TypedEventHandlerFunc[O, R]
-	predicates []predicate.TypedPredicate[O]
-	project    func(cluster.Cluster, O) (O, error)
+type kind[object client.Object, request mcreconcile.ClusterAware[request]] struct {
+	obj        object
+	handler    mchandler.TypedEventHandlerFunc[object, request]
+	predicates []predicate.TypedPredicate[object]
+	project    func(cluster.Cluster, object) (object, error)
 	resync     time.Duration
 }
 
-type clusterKind[O client.Object, R mcreconcile.ClusterAware[R]] struct {
+type clusterKind[object client.Object, request mcreconcile.ClusterAware[request]] struct {
 	clusterName string
 	cl          cluster.Cluster
-	obj         O
-	h           handler.TypedEventHandler[O, R]
-	preds       []predicate.TypedPredicate[O]
+	obj         object
+	h           handler.TypedEventHandler[object, request]
+	preds       []predicate.TypedPredicate[object]
 	resync      time.Duration
 
 	mu           sync.Mutex
@@ -67,17 +80,17 @@ type clusterKind[O client.Object, R mcreconcile.ClusterAware[R]] struct {
 }
 
 // WithProjection sets the projection function for the KindSource.
-func (k *kind[O, R]) WithProjection(project func(cluster.Cluster, O) (O, error)) TypedSyncingSource[O, R] {
+func (k *kind[object, request]) WithProjection(project func(cluster.Cluster, object) (object, error)) TypedSyncingSource[object, request] {
 	k.project = project
 	return k
 }
 
-func (k *kind[O, R]) ForCluster(name string, cl cluster.Cluster) (crsource.TypedSource[R], error) {
+func (k *kind[object, request]) ForCluster(name string, cl cluster.Cluster) (crsource.TypedSource[request], error) {
 	obj, err := k.project(cl, k.obj)
 	if err != nil {
 		return nil, err
 	}
-	return &clusterKind[O, R]{
+	return &clusterKind[object, request]{
 		clusterName: name,
 		cl:          cl,
 		obj:         obj,
@@ -87,16 +100,16 @@ func (k *kind[O, R]) ForCluster(name string, cl cluster.Cluster) (crsource.Typed
 	}, nil
 }
 
-func (k *kind[O, R]) SyncingForCluster(name string, cl cluster.Cluster) (crsource.TypedSyncingSource[R], error) {
+func (k *kind[object, request]) SyncingForCluster(name string, cl cluster.Cluster) (crsource.TypedSyncingSource[request], error) {
 	src, err := k.ForCluster(name, cl)
 	if err != nil {
 		return nil, err
 	}
-	return src.(crsource.TypedSyncingSource[R]), nil
+	return src.(crsource.TypedSyncingSource[request]), nil
 }
 
 // WaitForSync satisfies TypedSyncingSource.
-func (ck *clusterKind[O, R]) WaitForSync(ctx context.Context) error {
+func (ck *clusterKind[object, request]) WaitForSync(ctx context.Context) error {
 	if !ck.cl.GetCache().WaitForCacheSync(ctx) {
 		return ctx.Err()
 	}
@@ -104,7 +117,7 @@ func (ck *clusterKind[O, R]) WaitForSync(ctx context.Context) error {
 }
 
 // Start registers a removable handler on the (scoped) informer and removes it on ctx.Done().
-func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLimitingInterface[R]) error {
+func (ck *clusterKind[object, request]) Start(ctx context.Context, q workqueue.TypedRateLimitingInterface[request]) error {
 	log := log.FromContext(ctx).WithValues("cluster", ck.clusterName, "source", "kind")
 
 	// Check if we're already started with this context
@@ -148,7 +161,7 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 	ck.mu.Unlock()
 
 	// predicate helpers
-	passCreate := func(e event.TypedCreateEvent[O]) bool {
+	passCreate := func(e event.TypedCreateEvent[object]) bool {
 		for _, p := range ck.preds {
 			if !p.Create(e) {
 				return false
@@ -156,7 +169,7 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 		}
 		return true
 	}
-	passUpdate := func(e event.TypedUpdateEvent[O]) bool {
+	passUpdate := func(e event.TypedUpdateEvent[object]) bool {
 		for _, p := range ck.preds {
 			if !p.Update(e) {
 				return false
@@ -164,7 +177,7 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 		}
 		return true
 	}
-	passDelete := func(e event.TypedDeleteEvent[O]) bool {
+	passDelete := func(e event.TypedDeleteEvent[object]) bool {
 		for _, p := range ck.preds {
 			if !p.Delete(e) {
 				return false
@@ -174,14 +187,14 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 	}
 
 	// typed event builders
-	makeCreate := func(o client.Object) event.TypedCreateEvent[O] {
-		return event.TypedCreateEvent[O]{Object: any(o).(O)}
+	makeCreate := func(o client.Object) event.TypedCreateEvent[object] {
+		return event.TypedCreateEvent[object]{Object: any(o).(object)}
 	}
-	makeUpdate := func(oo, no client.Object) event.TypedUpdateEvent[O] {
-		return event.TypedUpdateEvent[O]{ObjectOld: any(oo).(O), ObjectNew: any(no).(O)}
+	makeUpdate := func(oo, no client.Object) event.TypedUpdateEvent[object] {
+		return event.TypedUpdateEvent[object]{ObjectOld: any(oo).(object), ObjectNew: any(no).(object)}
 	}
-	makeDelete := func(o client.Object) event.TypedDeleteEvent[O] {
-		return event.TypedDeleteEvent[O]{Object: any(o).(O)}
+	makeDelete := func(o client.Object) event.TypedDeleteEvent[object] {
+		return event.TypedDeleteEvent[object]{Object: any(o).(object)}
 	}
 
 	// Adapter that forwards to controller handler, honoring ctx.
@@ -204,8 +217,6 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 			ooObj, ok1 := oo.(client.Object)
 			noObj, ok2 := no.(client.Object)
 			if ok1 && ok2 {
-				log.V(1).Info("kind source update", "cluster", ck.clusterName,
-					"name", noObj.GetName(), "ns", noObj.GetNamespace())
 				e := makeUpdate(ooObj, noObj)
 				if passUpdate(e) {
 					ck.h.Update(ctx, e, q)
@@ -277,6 +288,6 @@ func (ck *clusterKind[O, R]) Start(ctx context.Context, q workqueue.TypedRateLim
 }
 
 // getInformer resolves the informer from the cluster cache (provider returns a scoped informer).
-func (ck *clusterKind[O, R]) getInformer(ctx context.Context, obj client.Object) (crcache.Informer, error) {
+func (ck *clusterKind[object, request]) getInformer(ctx context.Context, obj client.Object) (crcache.Informer, error) {
 	return ck.cl.GetCache().GetInformer(ctx, obj)
 }

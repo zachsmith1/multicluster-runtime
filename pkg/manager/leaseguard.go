@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package manager
 
 import (
@@ -11,6 +27,32 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// leaseGuard manages a single Lease as a *fence* for one shard/cluster.
+//
+// Design/semantics:
+//
+//   - TryAcquire(ctx) attempts to create/adopt the Lease for holder `id`,
+//     and, on success, starts a background renew loop. It is idempotent:
+//     calling it while already held is a cheap true.
+//
+//   - Renewing: a ticker renews the Lease every `renew`. If renewal fails
+//     (API error, conflict, or we observe another holder while still valid),
+//     `onLost` is invoked once (best-effort), the fence is released, and the
+//     loop exits.
+//
+//   - Release(ctx) stops renewing and, if we still own the Lease, clears
+//     HolderIdentity (best-effort). Safe to call multiple times.
+//
+//   - Thread-safety: leaseGuard is intended to be used by a single goroutine
+//     (caller) per fence. External synchronization is required if multiple
+//     goroutines might call its methods concurrently.
+//
+//   - Timings: choose ldur (duration) > renew. A common pattern is
+//     renew ≈ ldur/3. Too small ldur increases churn; too large slows
+//     failover.
+//
+// RBAC: the caller’s client must be allowed to get/list/watch/create/update/patch
+// Leases in namespace `ns`.
 type leaseGuard struct {
 	c       client.Client
 	ns, nm  string
@@ -23,11 +65,14 @@ type leaseGuard struct {
 	cancel context.CancelFunc
 }
 
+// newLeaseGuard builds a guard; it does not contact the API server.
 func newLeaseGuard(c client.Client, ns, name, id string, ldur, renew time.Duration, onLost func()) *leaseGuard {
 	return &leaseGuard{c: c, ns: ns, nm: name, id: id, ldur: ldur, renew: renew, onLost: onLost}
 }
 
-// TryAcquire attempts to acquire the lease. Returns true if we own it (or already owned).
+// TryAcquire creates/adopts the Lease for g.id and starts renewing it.
+// Returns true iff we own it after this call (or already owned).
+// Fails (returns false) when another non-expired holder exists or API calls error.
 func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 	if g.held {
 		return true
@@ -87,6 +132,8 @@ func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 	return true
 }
 
+// Internal: renew loop and single-step renew. If renewal observes a different,
+// valid holder or API errors persist, onLost() is invoked once and the fence is released.
 func (g *leaseGuard) renewLoop(ctx context.Context, key types.NamespacedName) {
 	t := time.NewTicker(g.renew)
 	defer t.Stop()

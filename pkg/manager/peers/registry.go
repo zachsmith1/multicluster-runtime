@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package peers
 
 import (
@@ -11,6 +27,7 @@ import (
 	coordv1 "k8s.io/api/coordination/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
@@ -130,9 +147,9 @@ func (r *leaseRegistry) renewSelfLease(ctx context.Context) error {
 				},
 			},
 			Spec: coordv1.LeaseSpec{
-				HolderIdentity:       strPtr(r.self.ID),
+				HolderIdentity:       ptr.To(r.self.ID),
 				RenewTime:            &now,
-				LeaseDurationSeconds: int32Ptr(ttlSec),
+				LeaseDurationSeconds: ptr.To(ttlSec),
 			},
 		}
 		return r.cli.Create(ctx, lease)
@@ -142,9 +159,9 @@ func (r *leaseRegistry) renewSelfLease(ctx context.Context) error {
 
 	default:
 		// Update the existing Lease
-		lease.Spec.HolderIdentity = strPtr(r.self.ID)
+		lease.Spec.HolderIdentity = ptr.To(r.self.ID)
 		lease.Spec.RenewTime = &now
-		lease.Spec.LeaseDurationSeconds = int32Ptr(ttlSec)
+		lease.Spec.LeaseDurationSeconds = ptr.To(ttlSec)
 		if lease.Annotations == nil {
 			lease.Annotations = map[string]string{}
 		}
@@ -207,6 +224,3 @@ func (r *leaseRegistry) refreshPeers(ctx context.Context) error {
 	r.mu.Unlock()
 	return nil
 }
-
-func strPtr(s string) *string   { return &s }
-func int32Ptr(i int32) *int32   { return &i }

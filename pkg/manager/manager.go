@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -131,50 +130,7 @@ var _ Manager = &mcManager{}
 type mcManager struct {
 	manager.Manager
 	provider multicluster.Provider
-
-	mcRunnables []multicluster.Aware
-
-	peers   peerRegistry
-	sharder sharder.Sharder
-	self    sharder.PeerInfo
-
-	engMu   sync.Mutex
-	engaged map[string]*engagement
-
-	shardLeaseNS, shardLeaseName string
-	perClusterLease              bool
-
-	leaseDuration time.Duration
-	leaseRenew    time.Duration
-	fenceThrottle time.Duration
-
-	peerLeasePrefix                 string
-	peerWeight                      uint32
-	ownershipProbe, ownershipRehash time.Duration
-}
-
-type engagement struct {
-	name    string
-	cl      cluster.Cluster
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
-
-	fence   *leaseGuard
-	nextTry time.Time
-}
-
-func (m *mcManager) fenceName(cluster string) string {
-	if m.perClusterLease {
-		return fmt.Sprintf("%s-%s", m.shardLeaseName, cluster)
-	}
-	return m.shardLeaseName
-}
-
-type peerRegistry interface {
-	Self() sharder.PeerInfo
-	Snapshot() []sharder.PeerInfo
-	Run(ctx context.Context) error
+	engine   *ownershipEngine
 }
 
 // New returns a new Manager for creating Controllers. The provider is used to
@@ -190,144 +146,27 @@ func New(config *rest.Config, provider multicluster.Provider, opts manager.Optio
 
 // WithMultiCluster wraps a host manager to run multi-cluster controllers.
 func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Manager, error) {
-	m := &mcManager{
-		Manager:  mgr,
-		provider: provider,
-		sharder:  sharder.NewHRW(),
-		engaged:  map[string]*engagement{},
-
-		shardLeaseNS:   "kube-system",
-		shardLeaseName: "mcr-shard",
-
-		peerLeasePrefix: "mcr-peer",
-		perClusterLease: true,
-
-		leaseDuration: 20 * time.Second,
-		leaseRenew:    10 * time.Second,
-		fenceThrottle: 750 * time.Millisecond,
-
-		peerWeight:      1,
-		ownershipProbe:  5 * time.Second,
-		ownershipRehash: 15 * time.Second,
+	cfg := OwnershipConfig{
+		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
+		LeaseDuration: 20 * time.Second, LeaseRenew: 10 * time.Second, FenceThrottle: 750 * time.Millisecond,
+		PeerPrefix: "mcr-peer", PeerWeight: 1, Probe: 5 * time.Second, Rehash: 15 * time.Second,
 	}
 
-	m.peers = peers.NewLeaseRegistry(mgr.GetClient(), m.shardLeaseNS, m.peerLeasePrefix, "", m.peerWeight)
-	m.self = m.peers.Self()
+	pr := peers.NewLeaseRegistry(mgr.GetClient(), cfg.FenceNS, cfg.PeerPrefix, "", cfg.PeerWeight)
+	self := pr.Self()
+
+	eng := newOwnershipEngine(
+		mgr.GetClient(), mgr.GetLogger(),
+		sharder.NewHRW(), pr, self, cfg,
+	)
+
+	m := &mcManager{Manager: mgr, provider: provider, engine: eng}
 
 	// Start ownership loop as a manager Runnable.
-	if err := mgr.Add(m.newOwnershipRunnable()); err != nil {
+	if err := mgr.Add(eng.Runnable()); err != nil {
 		return nil, err
 	}
 	return m, nil
-}
-
-func (m *mcManager) newOwnershipRunnable() manager.Runnable {
-	return manager.RunnableFunc(func(ctx context.Context) error {
-		m.GetLogger().Info("ownership runnable starting", "peer", m.self.ID)
-		errCh := make(chan error, 1)
-		go func() { errCh <- m.peers.Run(ctx) }()
-
-		m.recomputeOwnership(ctx)
-		t := time.NewTicker(m.ownershipProbe)
-		defer t.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case err := <-errCh:
-				if err != nil {
-					return fmt.Errorf("peer registry stopped: %w", err)
-				}
-				return nil
-			case <-t.C:
-				m.GetLogger().V(1).Info("ownership tick", "peers", len(m.peers.Snapshot()))
-				m.recomputeOwnership(ctx)
-			}
-		}
-	})
-}
-
-func (m *mcManager) recomputeOwnership(parent context.Context) {
-	peers := m.peers.Snapshot()
-	self := m.self
-
-	type toStart struct {
-		name string
-		cl   cluster.Cluster
-		ctx  context.Context
-	}
-	var starts []toStart
-	var stops []context.CancelFunc
-
-	now := time.Now()
-
-	m.engMu.Lock()
-	for name, e := range m.engaged {
-		should := m.sharder.ShouldOwn(name, peers, self)
-
-		switch {
-		case should && !e.started:
-			// ensure fence exists
-			if e.fence == nil {
-				onLost := func(cluster string) func() {
-					return func() {
-						// best-effort stop if we lose the lease mid-flight
-						m.GetLogger().Info("lease lost; stopping", "cluster", cluster, "peer", self.ID)
-						m.engMu.Lock()
-						if ee := m.engaged[cluster]; ee != nil && ee.started && ee.cancel != nil {
-							ee.cancel()
-							ee.started = false
-						}
-						m.engMu.Unlock()
-					}
-				}(name)
-				e.fence = newLeaseGuard(
-					m.Manager.GetClient(),
-					m.shardLeaseNS, m.fenceName(name), m.self.ID,
-					m.leaseDuration, m.leaseRenew, onLost,
-				)
-			}
-
-			// throttle attempts
-			if now.Before(e.nextTry) {
-				continue
-			}
-
-			// try to take the fence; if we fail, set nextTry and retry on next tick
-			if !e.fence.TryAcquire(parent) {
-				e.nextTry = now.Add(m.fenceThrottle)
-				continue
-			}
-
-			// acquired fence; start the cluster
-			ctx, cancel := context.WithCancel(parent)
-			e.ctx, e.cancel, e.started = ctx, cancel, true
-			starts = append(starts, toStart{name: e.name, cl: e.cl, ctx: ctx})
-			m.GetLogger().Info("ownership start", "cluster", name, "peer", self.ID)
-
-		case !should && e.started:
-			// stop + release fence
-			if e.cancel != nil {
-				stops = append(stops, e.cancel)
-			}
-			if e.fence != nil {
-				go e.fence.Release(parent)
-			}
-			e.cancel = nil
-			e.started = false
-			e.nextTry = time.Time{}
-			m.GetLogger().Info("ownership stop", "cluster", name, "peer", self.ID)
-		}
-	}
-	m.engMu.Unlock()
-
-	for _, c := range stops {
-		c()
-	}
-	for _, s := range starts {
-		go m.startForCluster(s.ctx, s.name, s.cl)
-	}
 }
 
 // GetCluster returns a cluster for the given identifying cluster name. Get
@@ -365,65 +204,15 @@ func (m *mcManager) GetProvider() multicluster.Provider {
 
 // Add will set requested dependencies on the component, and cause the component to be
 // started when Start is called.
-func (m *mcManager) Add(r Runnable) (err error) {
-	m.mcRunnables = append(m.mcRunnables, r)
-	defer func() {
-		if err != nil {
-			m.mcRunnables = m.mcRunnables[:len(m.mcRunnables)-1]
-		}
-	}()
-
+func (m *mcManager) Add(r Runnable) error {
+	m.engine.AddRunnable(r)
 	return m.Manager.Add(r)
 }
 
 // Engage gets called when the component should start operations for the given
 // Cluster. ctx is cancelled when the cluster is disengaged.
-func (m *mcManager) Engage(parent context.Context, name string, cl cluster.Cluster) error {
-	m.engMu.Lock()
-	e, ok := m.engaged[name]
-	if !ok {
-		e = &engagement{name: name, cl: cl}
-		m.engaged[name] = e
-
-		// cleanup when provider disengages the cluster
-		go func(pctx context.Context, key string) {
-			<-pctx.Done()
-			m.engMu.Lock()
-			if ee, ok := m.engaged[key]; ok {
-				if ee.started && ee.cancel != nil {
-					ee.cancel()
-				}
-				if ee.fence != nil {
-					// best-effort release fence so a new owner can acquire immediately
-					go ee.fence.Release(context.Background())
-				}
-				delete(m.engaged, key)
-			}
-			m.engMu.Unlock()
-		}(parent, name)
-	} else {
-		// provider may hand a new cluster impl for the same name
-		e.cl = cl
-	}
-	m.engMu.Unlock()
-	// No starting here; recomputeOwnership() will start/stop safely.
-	return nil
-}
-
-func (m *mcManager) startForCluster(ctx context.Context, name string, cl cluster.Cluster) {
-	for _, r := range m.mcRunnables {
-		if err := r.Engage(ctx, name, cl); err != nil {
-			m.GetLogger().Error(err, "failed to engage", "cluster", name)
-			// best-effort: cancel + mark stopped so next tick can retry
-			m.engMu.Lock()
-			if e := m.engaged[name]; e != nil && e.cancel != nil {
-				e.cancel()
-				e.started = false
-			}
-			m.engMu.Unlock()
-			return
-		}
-	}
+func (m *mcManager) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
+	return m.engine.Engage(ctx, name, cl)
 }
 
 func (m *mcManager) GetManager(ctx context.Context, clusterName string) (manager.Manager, error) {
