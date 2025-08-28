@@ -72,7 +72,7 @@ func newLeaseGuard(c client.Client, ns, name, id string, ldur, renew time.Durati
 }
 
 // TryAcquire creates/adopts the Lease for g.id and starts renewing it.
-// Returns true iff we own it after this call (or already owned).
+// Returns true if we own it after this call (or already owned).
 // Fails (returns false) when another non-expired holder exists or API calls error.
 func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 	if g.held {
