@@ -64,8 +64,8 @@ func WithPerClusterLease(on bool) Option {
 	}
 }
 
-// WithOwnershipIntervals tunes the ownership probe/rehash cadences.
-func WithOwnershipIntervals(probe, rehash time.Duration) Option {
+// WithSynchronizationIntervals tunes the synchronization probe/rehash cadences.
+func WithSynchronizationIntervals(probe, rehash time.Duration) Option {
 	return func(m *mcManager) {
 		if m.engine != nil {
 			m.engine.cfg.Probe = probe

@@ -33,7 +33,7 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
-// OwnershipConfig holds the knobs for shard ownership and fencing.
+// SynchronizationConfig holds the knobs for shard synchronization and fencing.
 //
 // Fencing:
 //   - FenceNS/FencePrefix: namespace and name prefix for per-shard Lease objects
@@ -49,9 +49,9 @@ import (
 //   - PeerWeight: relative capacity hint used by the sharder (0 treated as 1).
 //
 // Cadence:
-//   - Probe: periodic ownership tick interval (decision loop).
+//   - Probe: periodic synchronization tick interval (decision loop).
 //   - Rehash: optional slower cadence for planned redistribution (unused in basic HRW).
-type OwnershipConfig struct {
+type SynchronizationConfig struct {
 	// FenceNS is the namespace where fence Leases live (usually "kube-system").
 	FenceNS string
 	// FencePrefix is the base Lease name for fences; with PerClusterLease it becomes
@@ -72,13 +72,13 @@ type OwnershipConfig struct {
 	// PeerWeight is this peer’s capacity hint for HRW (0 treated as 1).
 	PeerWeight uint32
 
-	// Probe is the ownership decision loop interval.
+	// Probe is the synchronization decision loop interval.
 	Probe time.Duration
 	// Rehash is an optional slower cadence for planned redistribution (currently unused).
 	Rehash time.Duration
 }
 
-// ownershipEngine makes ownership decisions and starts/stops per-cluster work.
+// synchronizationEngine makes synchronization decisions and starts/stops per-cluster work.
 //
 // It combines:
 //   - a peerRegistry (live peer snapshot),
@@ -87,7 +87,7 @@ type OwnershipConfig struct {
 //
 // The engine keeps per-cluster engagement state, ties watches/workers to an
 // engagement context, and uses the fence to guarantee single-writer semantics.
-type ownershipEngine struct {
+type synchronizationEngine struct {
 	// kube is the host cluster client used for Leases and provider operations.
 	kube client.Client
 	// log is the engine’s logger.
@@ -98,8 +98,8 @@ type ownershipEngine struct {
 	peers peers.Registry
 	// self is this process’s identity/weight as known by the peer registry.
 	self sharder.PeerInfo
-	// cfg holds all ownership/fencing configuration.
-	cfg OwnershipConfig
+	// cfg holds all synchronization/fencing configuration.
+	cfg SynchronizationConfig
 
 	// mu guards engaged and runnables.
 	mu sync.Mutex
@@ -133,16 +133,16 @@ type engagement struct {
 	nextTry time.Time
 }
 
-// newOwnershipEngine wires an engine with its dependencies and initial config.
-func newOwnershipEngine(kube client.Client, log logr.Logger, shard sharder.Sharder, peers peers.Registry, self sharder.PeerInfo, cfg OwnershipConfig) *ownershipEngine {
-	return &ownershipEngine{
+// newSynchronizationEngine wires an engine with its dependencies and initial config.
+func newSynchronizationEngine(kube client.Client, log logr.Logger, shard sharder.Sharder, peers peers.Registry, self sharder.PeerInfo, cfg SynchronizationConfig) *synchronizationEngine {
+	return &synchronizationEngine{
 		kube: kube, log: log,
 		sharder: shard, peers: peers, self: self, cfg: cfg,
 		engaged: make(map[string]*engagement),
 	}
 }
 
-func (e *ownershipEngine) fenceName(cluster string) string {
+func (e *synchronizationEngine) fenceName(cluster string) string {
 	// Per-cluster fence: mcr-shard-<cluster>; otherwise a single global fence
 	if e.cfg.PerClusterLease {
 		return fmt.Sprintf("%s-%s", e.cfg.FencePrefix, cluster)
@@ -150,10 +150,10 @@ func (e *ownershipEngine) fenceName(cluster string) string {
 	return e.cfg.FencePrefix
 }
 
-// Runnable returns a Runnable that manages ownership of clusters.
-func (e *ownershipEngine) Runnable() manager.Runnable {
+// Runnable returns a Runnable that manages synchronization of clusters.
+func (e *synchronizationEngine) Runnable() manager.Runnable {
 	return manager.RunnableFunc(func(ctx context.Context) error {
-		e.log.Info("ownership runnable starting", "peer", e.self.ID)
+		e.log.Info("synchronization runnable starting", "peer", e.self.ID)
 		errCh := make(chan error, 1)
 		go func() { errCh <- e.peers.Run(ctx) }()
 		e.recompute(ctx)
@@ -166,15 +166,15 @@ func (e *ownershipEngine) Runnable() manager.Runnable {
 			case err := <-errCh:
 				return err
 			case <-t.C:
-				e.log.V(1).Info("ownership tick", "peers", len(e.peers.Snapshot()))
+				e.log.V(1).Info("synchronization tick", "peers", len(e.peers.Snapshot()))
 				e.recompute(ctx)
 			}
 		}
 	})
 }
 
-// Engage registers a cluster for ownership management.
-func (e *ownershipEngine) Engage(parent context.Context, name string, cl cluster.Cluster) error {
+// Engage registers a cluster for synchronization management.
+func (e *synchronizationEngine) Engage(parent context.Context, name string, cl cluster.Cluster) error {
 	// If provider already canceled, don't engage a dead cluster.
 	if err := parent.Err(); err != nil {
 		return err
@@ -243,8 +243,8 @@ func (e *ownershipEngine) Engage(parent context.Context, name string, cl cluster
 	return nil
 }
 
-// recomputeOwnership checks the current ownership state and starts/stops clusters as needed.
-func (e *ownershipEngine) recompute(parent context.Context) {
+// recompute checks the current synchronization state and starts/stops clusters as needed.
+func (e *synchronizationEngine) recompute(parent context.Context) {
 	peers := e.peers.Snapshot()
 	self := e.self
 
@@ -301,7 +301,7 @@ func (e *ownershipEngine) recompute(parent context.Context) {
 			ctx, cancel := context.WithCancel(parent)
 			engm.ctx, engm.cancel, engm.started = ctx, cancel, true
 			starts = append(starts, toStart{name: engm.name, cl: engm.cl, ctx: ctx})
-			e.log.Info("ownership start", "cluster", name, "peer", self.ID)
+			e.log.Info("synchronization start", "cluster", name, "peer", self.ID)
 
 		case !should && engm.started:
 			// stop + release fence
@@ -314,7 +314,7 @@ func (e *ownershipEngine) recompute(parent context.Context) {
 			engm.cancel = nil
 			engm.started = false
 			engm.nextTry = time.Time{}
-			e.log.Info("ownership stop", "cluster", name, "peer", self.ID)
+			e.log.Info("synchronization stop", "cluster", name, "peer", self.ID)
 		}
 	}
 	for _, c := range stops {
@@ -326,7 +326,7 @@ func (e *ownershipEngine) recompute(parent context.Context) {
 }
 
 // startForCluster engages all runnables for the given cluster.
-func (e *ownershipEngine) startForCluster(ctx context.Context, name string, cl cluster.Cluster) {
+func (e *synchronizationEngine) startForCluster(ctx context.Context, name string, cl cluster.Cluster) {
 	for _, r := range e.runnables {
 		if err := r.Engage(ctx, name, cl); err != nil {
 			e.log.Error(err, "failed to engage", "cluster", name)
@@ -342,4 +342,6 @@ func (e *ownershipEngine) startForCluster(ctx context.Context, name string, cl c
 	}
 }
 
-func (e *ownershipEngine) AddRunnable(r multicluster.Aware) { e.runnables = append(e.runnables, r) }
+func (e *synchronizationEngine) AddRunnable(r multicluster.Aware) {
+	e.runnables = append(e.runnables, r)
+}

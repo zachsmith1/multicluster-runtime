@@ -1,12 +1,12 @@
 # Sharded Namespace Example
 
-This demo runs two replicas of a multicluster manager that **split ownership** of downstream "clusters" discovered by the *namespace provider* (each Kubernetes Namespace == one cluster). Ownership is decided by HRW hashing across peers, then serialized with per-cluster fencing Leases so exactly one peer reconciles a given cluster at a time.
+This demo runs two replicas of a multicluster manager that **splits ownership** of downstream "clusters" discovered by the *namespace provider* (each Kubernetes Namespace == one cluster). Synchronization is decided by HRW hashing across peers, then serialized with per-cluster fencing Leases so exactly one peer reconciles a given cluster at a time.
 
 **Key Components:**
 - **Peer membership (presence)**: `coordination.k8s.io/Lease` with prefix `mcr-peer-*`
-- **Per-cluster fencing (ownership)**: `coordination.k8s.io/Lease` with prefix `mcr-shard-<namespace>`
+- **Per-cluster fencing (synchronization)**: `coordination.k8s.io/Lease` with prefix `mcr-shard-<namespace>`
 
-Controllers attach per-cluster watches when ownership starts, and cleanly detach & re-attach when ownership transfers.
+Controllers attach per-cluster watches when synchronization starts, and cleanly detach & re-attach when it transfers.
 
 ## Build the image
 
@@ -39,8 +39,8 @@ kubectl -n mcr-demo logs statefulset/sharded-namespace -f
 
 You should see lines like:
 ```bash
-"ownership start    {"cluster": "zoo", "peer": "sharded-namespace-0"}"
-"ownership start    {"cluster": "jungle", "peer": "sharded-namespace-1"}"
+"synchronization start    {"cluster": "zoo", "peer": "sharded-namespace-0"}"
+"synchronization start    {"cluster": "jungle", "peer": "sharded-namespace-1"}"
 
 Reconciling ConfigMap    {"controller": "multicluster-configmaps", "controllerGroup": "", "controllerKind": "ConfigMap", "reconcileID": "4f1116b3-b5 │
 │ 4e-4e6a-b84f-670ca5cfc9ce", "cluster": "zoo", "ns": "default", "name": "elephant"}  
@@ -66,9 +66,9 @@ kubectl -n kube-system get lease mcr-shard-$C \
 ```
 
 
-## Test Ownership
+## Test Synchronization
 
-Scale down to 1 replica and watch ownership consolidate:
+Scale down to 1 replica and watch synchronization consolidate:
 ```bash
 # Scale down
 kubectl -n mcr-demo scale statefulset/sharded-namespace --replicas=1
@@ -92,7 +92,7 @@ kubectl -n "$C" create cm test-$(date +%s) --from-literal=ts=$(date +%s) --dry-r
 kubectl -n mcr-demo logs pod/sharded-namespace-0 --since=100s | grep "Reconciling ConfigMap.*$C"
 ```
 
-Scale up to 3 replicas and watch ownership rebalance:
+Scale up to 3 replicas and watch synchronization rebalance:
 ```bash
 # Scale up
 kubectl -n mcr-demo scale statefulset/sharded-namespace --replicas=3

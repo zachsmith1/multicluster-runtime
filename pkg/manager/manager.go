@@ -130,7 +130,7 @@ var _ Manager = &mcManager{}
 type mcManager struct {
 	manager.Manager
 	provider multicluster.Provider
-	engine   *ownershipEngine
+	engine   *synchronizationEngine
 }
 
 // New returns a new Manager for creating Controllers. The provider is used to
@@ -146,7 +146,7 @@ func New(config *rest.Config, provider multicluster.Provider, opts manager.Optio
 
 // WithMultiCluster wraps a host manager to run multi-cluster controllers.
 func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Manager, error) {
-	cfg := OwnershipConfig{
+	cfg := SynchronizationConfig{
 		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
 		LeaseDuration: 20 * time.Second, LeaseRenew: 10 * time.Second, FenceThrottle: 750 * time.Millisecond,
 		PeerPrefix: "mcr-peer", PeerWeight: 1, Probe: 5 * time.Second, Rehash: 15 * time.Second,
@@ -155,14 +155,14 @@ func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Mana
 	pr := peers.NewLeaseRegistry(mgr.GetClient(), cfg.FenceNS, cfg.PeerPrefix, "", cfg.PeerWeight, mgr.GetLogger())
 	self := pr.Self()
 
-	eng := newOwnershipEngine(
+	eng := newSynchronizationEngine(
 		mgr.GetClient(), mgr.GetLogger(),
 		sharder.NewHRW(), pr, self, cfg,
 	)
 
 	m := &mcManager{Manager: mgr, provider: provider, engine: eng}
 
-	// Start ownership loop as a manager Runnable.
+	// Start synchronization loop as a manager Runnable.
 	if err := mgr.Add(eng.Runnable()); err != nil {
 		return nil, err
 	}
