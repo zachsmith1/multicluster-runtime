@@ -53,22 +53,23 @@ import (
 //     failover.
 //
 // RBAC: the caller’s client must be allowed to get/list/watch/create/update/patch
-// Leases in namespace `ns`.
+// Leases in namespace.
 type leaseGuard struct {
-	c      client.Client
-	ns, nm string
-	id     string
-	ldur   time.Duration // lease duration
-	renew  time.Duration // renew period
-	onLost func()        // callback when we lose the lease
+	client    client.Client
+	namespace string
+	name      string
+	id        string
+	ldur      time.Duration // lease duration
+	renew     time.Duration // renew period
+	onLost    func()        // callback when we lose the lease
 
 	held   bool
 	cancel context.CancelFunc
 }
 
 // newLeaseGuard builds a guard; it does not contact the API server.
-func newLeaseGuard(c client.Client, ns, name, id string, ldur, renew time.Duration, onLost func()) *leaseGuard {
-	return &leaseGuard{c: c, ns: ns, nm: name, id: id, ldur: ldur, renew: renew, onLost: onLost}
+func newLeaseGuard(client client.Client, namespace, name, id string, ldur, renew time.Duration, onLost func()) *leaseGuard {
+	return &leaseGuard{client: client, namespace: namespace, name: name, id: id, ldur: ldur, renew: renew, onLost: onLost}
 }
 
 // TryAcquire creates/adopts the Lease for g.id and starts renewing it.
@@ -79,17 +80,17 @@ func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 		return true
 	}
 
-	key := types.NamespacedName{Namespace: g.ns, Name: g.nm}
+	key := types.NamespacedName{Namespace: g.namespace, Name: g.name}
 	now := metav1.NowMicro()
 
 	ldurSec := int32(g.ldur / time.Second)
 
 	var ls coordinationv1.Lease
-	err := g.c.Get(ctx, key, &ls)
+	err := g.client.Get(ctx, key, &ls)
 	switch {
 	case apierrors.IsNotFound(err):
 		ls = coordinationv1.Lease{
-			ObjectMeta: metav1.ObjectMeta{Namespace: g.ns, Name: g.nm},
+			ObjectMeta: metav1.ObjectMeta{Namespace: g.namespace, Name: g.name},
 			Spec: coordinationv1.LeaseSpec{
 				HolderIdentity:       &g.id,
 				LeaseDurationSeconds: &ldurSec,
@@ -97,7 +98,7 @@ func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 				RenewTime:            &now,
 			},
 		}
-		if err := g.c.Create(ctx, &ls); err != nil {
+		if err := g.client.Create(ctx, &ls); err != nil {
 			return false
 		}
 	case err != nil:
@@ -120,7 +121,7 @@ func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 			ls.Spec.AcquireTime = &now
 		}
 		ls.Spec.RenewTime = &now
-		if err := g.c.Update(ctx, &ls); err != nil {
+		if err := g.client.Update(ctx, &ls); err != nil {
 			return false
 		}
 	}
@@ -158,7 +159,7 @@ func (g *leaseGuard) renewLoop(ctx context.Context, key types.NamespacedName) {
 func (g *leaseGuard) renewOnce(ctx context.Context, key types.NamespacedName) bool {
 	now := metav1.NowMicro()
 	var ls coordinationv1.Lease
-	if err := g.c.Get(ctx, key, &ls); err != nil {
+	if err := g.client.Get(ctx, key, &ls); err != nil {
 		return false
 	}
 	// another holder?
@@ -170,7 +171,7 @@ func (g *leaseGuard) renewOnce(ctx context.Context, key types.NamespacedName) bo
 	ls.Spec.HolderIdentity = &g.id
 	ls.Spec.LeaseDurationSeconds = &ldurSec
 	ls.Spec.RenewTime = &now
-	if err := g.c.Update(ctx, &ls); err != nil {
+	if err := g.client.Update(ctx, &ls); err != nil {
 		return false
 	}
 	return true
@@ -186,14 +187,14 @@ func (g *leaseGuard) Release(ctx context.Context) {
 	}
 	g.held = false
 
-	key := types.NamespacedName{Namespace: g.ns, Name: g.nm}
+	key := types.NamespacedName{Namespace: g.namespace, Name: g.name}
 	var ls coordinationv1.Lease
-	if err := g.c.Get(ctx, key, &ls); err == nil {
+	if err := g.client.Get(ctx, key, &ls); err == nil {
 		if ls.Spec.HolderIdentity != nil && *ls.Spec.HolderIdentity == g.id {
 			empty := ""
 			ls.Spec.HolderIdentity = &empty
 			// keep RenewTime/AcquireTime; just clear holder
-			_ = g.c.Update(ctx, &ls) // ignore errors
+			_ = g.client.Update(ctx, &ls) // ignore errors
 		}
 	}
 }
