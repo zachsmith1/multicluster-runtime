@@ -22,8 +22,8 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
 )
 
-// Option mutates mcManager after construction.
-// Options must be applied after WithMultiCluster(...) and before Start(...).
+// Option mutates mcManager configuration.
+// Prefer passing options directly to New/WithMultiCluster so overrides apply before wiring runnables.
 type Option func(*mcManager)
 
 // WithSharder replaces the default HRW sharder.
@@ -82,16 +82,6 @@ func WithLeaseTimings(duration, renew, throttle time.Duration) Option {
 			m.engine.cfg.LeaseDuration = duration
 			m.engine.cfg.LeaseRenew = renew
 			m.engine.cfg.FenceThrottle = throttle
-		}
-	}
-}
-
-// Configure applies options to a Manager if it is an *mcManager.
-// Must be called before Start(); options do not rewire the running peer registry.
-func Configure(m Manager, opts ...Option) {
-	if x, ok := m.(*mcManager); ok {
-		for _, o := range opts {
-			o(x)
 		}
 	}
 }

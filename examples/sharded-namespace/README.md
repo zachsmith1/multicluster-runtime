@@ -75,7 +75,7 @@ kubectl -n mcr-demo scale statefulset/sharded-namespace --replicas=1
 
 
 # Watch leases lose their holders as pods terminate
-watch 'kubectl -n kube-system get lease -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity | grep "^mcr-shard-"'
+kubectl -n kube-system get lease -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity | grep "^mcr-shard-"
 
 # Wait for all clusters to be owned by the single remaining pod (~30s)
 kubectl -n kube-system wait --for=jsonpath='{.spec.holderIdentity}'=sharded-namespace-0 \
@@ -97,7 +97,7 @@ Scale up to 3 replicas and watch synchronization rebalance:
 # Scale up
 kubectl -n mcr-demo scale statefulset/sharded-namespace --replicas=3
 # Watch leases regain holders as pods start
-watch 'kubectl -n kube-system get lease -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity | grep "^mcr-shard-"'
+kubectl -n kube-system get lease -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity | grep "^mcr-shard-"
 
 # Create a cm in the default ns which belongs to sharded-namespace-2
 C=default
@@ -110,17 +110,20 @@ kubectl -n mcr-demo logs pod/sharded-namespace-2 --since=100s | grep "Reconcilin
 In your example app (e.g., examples/sharded-namespace/main.go), configure fencing and timings:
 
 ```go
-mcmanager.Configure(mgr,
+mgr, err := mcmanager.New(cfg, provider, manager.Options{},
   // Per-cluster fencing Leases live here as mcr-shard-<namespace>
   mcmanager.WithShardLease("kube-system", "mcr-shard"),
   mcmanager.WithPerClusterLease(true), // enabled by default
-  
+
   // Optional: tune fencing timings (duration, renew, throttle):
   // mcmanager.WithLeaseTimings(30*time.Second, 10*time.Second, 750*time.Millisecond),
-  
+
   // Optional: peer weight for HRW:
   // mcmanager.WithPeerWeight(1),
 )
+if err != nil {
+  // handle error
+}
 ```
 
 The peer registry uses mcr-peer-* automatically and derives the peer ID from the pod hostname (StatefulSet ordinal).

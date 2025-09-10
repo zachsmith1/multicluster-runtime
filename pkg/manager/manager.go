@@ -136,16 +136,16 @@ type mcManager struct {
 // New returns a new Manager for creating Controllers. The provider is used to
 // discover and manage clusters. With a provider set to nil, the manager will
 // behave like a regular controller-runtime manager.
-func New(config *rest.Config, provider multicluster.Provider, opts manager.Options) (Manager, error) {
+func New(config *rest.Config, provider multicluster.Provider, opts manager.Options, mcOpts ...Option) (Manager, error) {
 	mgr, err := manager.New(config, opts)
 	if err != nil {
 		return nil, err
 	}
-	return WithMultiCluster(mgr, provider)
+	return WithMultiCluster(mgr, provider, mcOpts...)
 }
 
 // WithMultiCluster wraps a host manager to run multi-cluster controllers.
-func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Manager, error) {
+func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider, mcOpts ...Option) (Manager, error) {
 	cfg := SynchronizationConfig{
 		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
 		LeaseDuration: 20 * time.Second, LeaseRenew: 10 * time.Second, FenceThrottle: 750 * time.Millisecond,
@@ -161,6 +161,11 @@ func WithMultiCluster(mgr manager.Manager, provider multicluster.Provider) (Mana
 	)
 
 	m := &mcManager{Manager: mgr, provider: provider, engine: eng}
+
+	// Apply options before wiring the Runnable so overrides take effect early.
+	for _, o := range mcOpts {
+		o(m)
+	}
 
 	// Start synchronization loop as a manager Runnable.
 	if err := mgr.Add(eng.Runnable()); err != nil {
