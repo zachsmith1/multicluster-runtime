@@ -29,6 +29,8 @@ import (
 
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	_ "github.com/onsi/ginkgo/v2"
 )
 
 const (

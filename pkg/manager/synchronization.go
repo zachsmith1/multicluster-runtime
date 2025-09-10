@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/peers"
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
+	"sigs.k8s.io/multicluster-runtime/pkg/util"
 )
 
 // SynchronizationConfig holds the knobs for shard synchronization and fencing.
@@ -145,7 +146,7 @@ func newSynchronizationEngine(kube client.Client, log logr.Logger, shard sharder
 func (e *synchronizationEngine) fenceName(cluster string) string {
 	// Per-cluster fence: mcr-shard-<cluster>; otherwise a single global fence
 	if e.cfg.PerClusterLease {
-		return fmt.Sprintf("%s-%s", e.cfg.FencePrefix, cluster)
+		return fmt.Sprintf("%s-%s", e.cfg.FencePrefix, util.SanitizeDNS1123(cluster))
 	}
 	return e.cfg.FencePrefix
 }
