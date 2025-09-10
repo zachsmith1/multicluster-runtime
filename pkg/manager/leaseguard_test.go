@@ -172,8 +172,6 @@ func TestRenewLoop_OnLostTriggersCallbackAndReleases(t *testing.T) {
 		t.Fatalf("expected onLost to be called after renewal detects loss")
 	}
 
-	// Give a moment for Release() to run
-	time.Sleep(50 * time.Millisecond)
 	if g.held {
 		t.Fatalf("guard should not be held after loss")
 	}
