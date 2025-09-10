@@ -140,7 +140,7 @@ func TestTryAcquire_AdoptsWhenExpired(t *testing.T) {
 	}
 }
 
-func TestRenewLoop_OnLostTriggersCallbackAndReleases(t *testing.T) {
+func TestRenewLoop_LossTriggersOnLostAndReleases(t *testing.T) {
 	s := newScheme(t)
 	c := fake.NewClientBuilder().WithScheme(s).Build()
 
@@ -171,7 +171,6 @@ func TestRenewLoop_OnLostTriggersCallbackAndReleases(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("expected onLost to be called after renewal detects loss")
 	}
-
 	if g.held {
 		t.Fatalf("guard should not be held after loss")
 	}
@@ -185,4 +184,42 @@ func TestRelease_NoHoldIsNoop(t *testing.T) {
 	// Not acquired yet; should be a no-op
 	g.Release(context.Background())
 	// Nothing to assert other than "does not panic"
+}
+
+func TestRenewLoop_ReleasesBeforeOnLost(t *testing.T) {
+	s := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(s).Build()
+
+	heldAtCallback := make(chan bool, 1)
+	var g *leaseGuard
+	g = newLeaseGuard(c, testNS, testName, testID, 3*time.Second, 50*time.Millisecond, func() {
+		heldAtCallback <- g.held
+	})
+
+	// Acquire
+	if ok := g.TryAcquire(context.Background()); !ok {
+		t.Fatalf("expected TryAcquire to succeed")
+	}
+
+	// Flip lease to another holder so renewOnce observes loss.
+	ls := getLease(t, c)
+	now := metav1.NowMicro()
+	dur := int32(3)
+	other := otherID
+	ls.Spec.HolderIdentity = &other
+	ls.Spec.LeaseDurationSeconds = &dur
+	ls.Spec.RenewTime = &now
+	if err := c.Update(context.Background(), ls); err != nil {
+		t.Fatalf("update lease: %v", err)
+	}
+
+	// Expect callback to observe held == false (Release runs before onLost)
+	select {
+	case v := <-heldAtCallback:
+		if v {
+			t.Fatalf("expected g.held=false at onLost callback time")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("expected onLost to be called after renewal detects loss")
+	}
 }

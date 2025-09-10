@@ -135,7 +135,7 @@ func (g *leaseGuard) TryAcquire(ctx context.Context) bool {
 }
 
 // Internal: renew loop and single-step renew. If renewal observes a different,
-// valid holder or API errors persist, onLost() is invoked once and the fence is released.
+// valid holder or API errors persist, the fence is released first and onLost() is invoked once.
 func (g *leaseGuard) renewLoop(ctx context.Context, key types.NamespacedName) {
 	t := time.NewTicker(g.renew)
 	defer t.Stop()
@@ -145,11 +145,11 @@ func (g *leaseGuard) renewLoop(ctx context.Context, key types.NamespacedName) {
 			return
 		case <-t.C:
 			if ok := g.renewOnce(ctx, key); !ok {
-				// best-effort notify once, then release
+				// best-effort: release, then notify once
+				g.Release(context.Background())
 				if g.onLost != nil {
 					g.onLost()
 				}
-				g.Release(context.Background())
 				return
 			}
 		}
