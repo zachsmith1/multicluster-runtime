@@ -53,9 +53,9 @@ func run(ctx context.Context) error {
 
 	// Multicluster manager (no peer ID passed; pod hostname becomes peer ID).
 	// Configure sharding:
-    // - fencing prefix: "mcr-shard" (per-cluster Lease names become mcr-shard-<cluster>)
-    // - peer membership still uses "mcr-peer" internally (set in WithMultiCluster)
-    // Peer ID defaults to os.Hostname().
+	// - fencing prefix: "mcr-shard" (per-cluster Lease names become mcr-shard-<cluster>)
+	// - peer membership still uses "mcr-peer" internally (set in WithMultiCluster)
+	// Peer ID defaults to os.Hostname().
 	mgr, err := mcmanager.New(cfg, provider, manager.Options{},
 		mcmanager.WithShardLease("kube-system", "mcr-shard"),
 		// optional but explicit (your manager already defaults this to true)
