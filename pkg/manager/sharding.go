@@ -19,11 +19,11 @@ package manager
 import (
 	"time"
 
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/peers"
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
 )
 
 // Option mutates mcManager configuration.
-// Prefer passing options directly to New/WithMultiCluster so overrides apply before wiring runnables.
 type Option func(*mcManager)
 
 // WithSharder replaces the default HRW sharder.
@@ -82,6 +82,18 @@ func WithLeaseTimings(duration, renew, throttle time.Duration) Option {
 			m.engine.cfg.LeaseDuration = duration
 			m.engine.cfg.LeaseRenew = renew
 			m.engine.cfg.FenceThrottle = throttle
+		}
+	}
+}
+
+// WithPeerRegistry injects a custom peer Registry. When set, it overrides the
+// default Lease-based registry. Peer weight should be provided by the custom
+// registry; WithPeerWeight does not apply.
+func WithPeerRegistry(reg peers.Registry) Option {
+	return func(m *mcManager) {
+		if m.engine != nil && reg != nil {
+			m.engine.peers = reg
+			m.engine.self = reg.Self()
 		}
 	}
 }
