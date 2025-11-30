@@ -19,25 +19,21 @@ package file
 import (
 	"context"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
-	"sync"
 
 	"github.com/go-logr/logr"
-	"github.com/google/go-cmp/cmp"
 	"gopkg.in/fsnotify.v1"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/clusters"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
 var _ multicluster.Provider = &Provider{}
+var _ multicluster.ProviderRunnable = &Provider{}
 
 // Options defines the options for the file-based cluster provider.
 type Options struct {
@@ -69,6 +65,9 @@ type Options struct {
 	// "my-context" would result in a cluster name
 	// "/a/b/c/kubeconfig.yaml+my-context".
 	Separator string
+
+	// ClusterOptions is the list of options to pass to the cluster object.
+	ClusterOptions []cluster.Option
 }
 
 // DefaultKubeconfigGlobs are the default glob patterns when searching
@@ -118,8 +117,8 @@ func New(opts Options) (*Provider, error) {
 	}
 
 	p.log = log.Log.WithName("file-cluster-provider")
-	p.clusters = make(map[string]cluster.Cluster)
-	p.clusterCancel = make(map[string]func())
+	p.Clusters = clusters.New[cluster.Cluster]()
+	p.Clusters.ErrorHandler = p.log.Error
 
 	p.log.Info("file cluster provider initialized",
 		"kubeconfigFiles", p.opts.KubeconfigFiles,
@@ -133,18 +132,15 @@ func New(opts Options) (*Provider, error) {
 // Provider is a multicluster.Provider that loads clusters from
 // kubeconfig files or directories on disk.
 type Provider struct {
+	clusters.Clusters[cluster.Cluster]
+
 	opts Options
-
-	log logr.Logger
-
-	clustersLock  sync.RWMutex
-	clusters      map[string]cluster.Cluster
-	clusterCancel map[string]func()
+	log  logr.Logger
 }
 
-// Run starts the provider and updates the clusters and is blocking.
-func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
-	if err := p.run(ctx, mgr); err != nil {
+// Start starts the provider and updates the clusters and is blocking.
+func (p *Provider) Start(ctx context.Context, mcAware multicluster.Aware) error {
+	if err := p.run(ctx, mcAware); err != nil {
 		return fmt.Errorf("initial update failed: %w", err)
 	}
 
@@ -181,7 +177,7 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 			// would also require to track which cluster belongs to
 			// which file.
 			// Instead clusters are just updated from all files.
-			if err := p.run(ctx, mgr); err != nil {
+			if err := p.run(ctx, mcAware); err != nil {
 				p.log.Error(err, "failed to update clusters after file change")
 			}
 		case err, ok := <-watcher.Errors:
@@ -194,74 +190,33 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 }
 
 // RunOnce performs a single update of the clusters.
-func (p *Provider) RunOnce(ctx context.Context, mgr mcmanager.Manager) error {
-	return p.run(ctx, mgr)
+func (p *Provider) RunOnce(ctx context.Context, mcAware multicluster.Aware) error {
+	return p.run(ctx, mcAware)
 }
 
-func (p *Provider) addCluster(ctx context.Context, mgr mcmanager.Manager, name string, cl cluster.Cluster) {
-	ctx, cancel := context.WithCancel(ctx)
-
-	p.clustersLock.Lock()
-	p.clusters[name] = cl
-	p.clusterCancel[name] = cancel
-	p.clustersLock.Unlock()
-
-	go func() {
-		if err := cl.Start(ctx); err != nil {
-			p.log.Error(err, "error in cluster", "name", name)
-		}
-		p.removeCluster(name)
-	}()
-
-	if mgr != nil {
-		if err := mgr.Engage(ctx, name, cl); err != nil {
-			cancel()
-			p.log.Error(err, "failed to engage cluster", "name", name)
-		}
-	}
-}
-
-func (p *Provider) removeCluster(name string) {
-	p.clustersLock.Lock()
-	defer p.clustersLock.Unlock()
-
-	if cancel, ok := p.clusterCancel[name]; ok {
-		cancel()
-		delete(p.clusters, name)
-		delete(p.clusterCancel, name)
-	}
-}
-
-func (p *Provider) run(ctx context.Context, mgr mcmanager.Manager) error {
+func (p *Provider) run(ctx context.Context, mcAware multicluster.Aware) error {
 	loadedClusters, err := p.loadClusters()
 	if err != nil {
 		return fmt.Errorf("failed to load clusters: %w", err)
 	}
-	knownClusters := p.ClusterNames()
+	knownClusters := p.Clusters.ClusterNames()
 
 	// add new clusters
-	for name, cl := range loadedClusters {
-		if slices.Contains(knownClusters, name) {
-			// update if the config has changed
-			existingCluster, _ := p.Get(ctx, name)
-			if !cmp.Equal(existingCluster.GetConfig(), cl.GetConfig()) {
-				p.log.Info("updating cluster", "name", name)
-				p.removeCluster(name)
-				p.addCluster(ctx, mgr, name, cl)
-			}
+	for clusterName, cl := range loadedClusters {
+		p.log.Info("adding or updating cluster", "clusterName", clusterName)
+		if err := p.Clusters.AddOrReplace(ctx, clusterName, cl, mcAware); err != nil {
+			p.log.Error(err, "failed to add or replace cluster", "clusterName", clusterName)
 			continue
 		}
-		p.log.Info("adding cluster", "name", name)
-		p.addCluster(ctx, mgr, name, cl)
 	}
 
 	// delete clusters that are no longer present
-	for _, name := range knownClusters {
-		if _, ok := loadedClusters[name]; ok {
+	for _, clusterName := range knownClusters {
+		if _, ok := loadedClusters[clusterName]; ok {
 			continue
 		}
-		p.log.Info("removing cluster", "name", name)
-		p.removeCluster(name)
+		p.log.Info("removing cluster", "clusterName", clusterName)
+		p.Clusters.Remove(clusterName)
 	}
 
 	return nil
@@ -270,39 +225,13 @@ func (p *Provider) run(ctx context.Context, mgr mcmanager.Manager) error {
 // Get returns the cluster with the given name.
 // If the cluster name is empty (""), it returns the first cluster
 // found.
-func (p *Provider) Get(_ context.Context, clusterName string) (cluster.Cluster, error) {
-	p.clustersLock.RLock()
-	defer p.clustersLock.RUnlock()
-
+func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster, error) {
 	if clusterName == "" {
-		for _, cl := range p.clusters {
-			return cl, nil
+		clusterNames := p.Clusters.ClusterNames()
+		if len(clusterNames) == 0 {
+			return nil, multicluster.ErrClusterNotFound
 		}
+		return p.Clusters.Get(ctx, clusterNames[0])
 	}
-
-	cl, ok := p.clusters[clusterName]
-	if !ok {
-		return nil, multicluster.ErrClusterNotFound
-	}
-	return cl, nil
-}
-
-// IndexField indexes a field on all clusters.
-func (p *Provider) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
-	p.clustersLock.RLock()
-	defer p.clustersLock.RUnlock()
-
-	for name, cl := range p.clusters {
-		if err := cl.GetCache().IndexField(ctx, obj, field, extractValue); err != nil {
-			return fmt.Errorf("failed to index field %q on cluster %q: %w", field, name, err)
-		}
-	}
-	return nil
-}
-
-// ClusterNames returns the names of all clusters known to the provider.
-func (p *Provider) ClusterNames() []string {
-	p.clustersLock.RLock()
-	defer p.clustersLock.RUnlock()
-	return slices.Sorted(maps.Keys(p.clusters))
+	return p.Clusters.Get(ctx, clusterName)
 }

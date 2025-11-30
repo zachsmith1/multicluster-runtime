@@ -22,6 +22,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 	"sigs.k8s.io/randfill"
@@ -29,9 +30,18 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
+
+func ignoreCanceled(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
 
 var _ = Describe("Provider File", Ordered, func() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,6 +51,7 @@ var _ = Describe("Provider File", Ordered, func() {
 	var kubeconfigDir string
 	var kubeconfigPath string
 	var provider *Provider
+	var manager mcmanager.Manager
 
 	BeforeAll(func() {
 		discoverDir = GinkgoT().TempDir()
@@ -56,9 +67,15 @@ var _ = Describe("Provider File", Ordered, func() {
 			Expect(err).NotTo(HaveOccurred())
 		})
 
-		By("Starting the provider", func() {
+		By("Creating a new manager", func() {
+			var err error
+			manager, err = mcmanager.New(localCfg, provider, mcmanager.Options{})
+			Expect(err).NotTo(HaveOccurred(), "Failed to create manager")
+		})
+
+		By("Starting the manager", func() {
 			g.Go(func() error {
-				return ignoreCanceled(provider.Run(ctx, nil))
+				return ignoreCanceled(manager.Start(ctx))
 			})
 		})
 
@@ -71,7 +88,6 @@ var _ = Describe("Provider File", Ordered, func() {
 			err := os.MkdirAll(kubeconfigDir, 0755)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create kubeconfig file")
 		})
-
 	})
 
 	It("should not have any clusters initially", func(ctx context.Context) {
@@ -82,6 +98,10 @@ var _ = Describe("Provider File", Ordered, func() {
 	var directoryContexts []string
 	It("should discover clusters from files inside the directories", func(ctx context.Context) {
 		By("Creating a kubeconfig file in the test directory", func() {
+			// Wait a second, otherwise fsnotify doesn't fire reliably,
+			// resulting in the test flaking.
+			time.Sleep(1 * time.Second)
+
 			var err error
 			directoryContexts, err = randomKubeconfig(1, filepath.Join(discoverDir, "kubeconfig.yaml"))
 			Expect(err).NotTo(HaveOccurred(), "Failed to write kubeconfig file")
@@ -93,7 +113,7 @@ var _ = Describe("Provider File", Ordered, func() {
 
 	var kubeconfigContexts []string
 	It("should discovery multiple clusters from passed filename", func(ctx context.Context) {
-		By("Creating multiple kubeconfig files in the test directory", func() {
+		By("Create kubeconfig file with multiple contexts", func() {
 			var err error
 			kubeconfigContexts, err = randomKubeconfig(2, kubeconfigPath)
 			Expect(err).NotTo(HaveOccurred(), "Failed to write kubeconfig files")
@@ -106,6 +126,7 @@ var _ = Describe("Provider File", Ordered, func() {
 	It("should discover clusters from both directories", func(ctx context.Context) {
 		Eventually(provider.ClusterNames, "10s", "1s").Should(ContainElements(directoryContexts), "Expected provider to discover clusters from directory")
 		Eventually(provider.ClusterNames, "10s", "1s").Should(ContainElements(kubeconfigContexts), "Expected provider to discover clusters from kubeconfig files")
+		Eventually(provider.ClusterNames, "10s", "1s").Should(HaveLen(len(directoryContexts)+len(kubeconfigContexts)), "Expected provider to have three clusters total")
 	})
 
 	It("should remove clusters when the respective kubeconfig is deleted", func(ctx context.Context) {
@@ -115,36 +136,31 @@ var _ = Describe("Provider File", Ordered, func() {
 		})
 
 		Eventually(provider.ClusterNames, "10s", "1s").ShouldNot(Equal(kubeconfigContexts), "Expected provider to remove kubeconfig contexts after file deletion")
+		Eventually(provider.ClusterNames, "10s", "1s").Should(Equal(directoryContexts), "Expected provider to only have directory contexts remaining")
 	})
 
 	var newDirectoryContexts []string
 	It("should remove old clusters and add new ones when kubeconfig files are updated", func(ctx context.Context) {
 		By("Updating the kubeconfig file in the test directory", func() {
 			var err error
-			newDirectoryContexts, err = randomKubeconfig(2, filepath.Join(discoverDir, "kubeconfig.yaml"))
+			newDirectoryContexts, err = randomKubeconfig(3, filepath.Join(discoverDir, "kubeconfig.yaml"))
 			Expect(err).NotTo(HaveOccurred(), "Failed to write updated kubeconfig file")
-			Expect(newDirectoryContexts).To(HaveLen(2), "Expected two new kubeconfig contexts to be generated")
+			Expect(newDirectoryContexts).To(HaveLen(3), "Expected two new kubeconfig contexts to be generated")
 		})
 
 		Eventually(provider.ClusterNames, "10s", "1s").Should(ContainElements(newDirectoryContexts), "Expected provider to discover new kubeconfig contexts")
 		Eventually(provider.ClusterNames, "10s", "1s").ShouldNot(ContainElements(directoryContexts), "Expected provider to remove old kubeconfig contexts")
+		Eventually(provider.ClusterNames, "10s", "1s").Should(HaveLen(len(newDirectoryContexts)), "Expected provider to have three clusters total")
 	})
 
 	AfterAll(func() {
-		By("Stopping the provider", func() {
+		By("Stopping the manager", func() {
 			cancel()
 			err := g.Wait()
-			Expect(err).To(Succeed(), "Expected provider to stop without error")
+			Expect(err).To(Succeed(), "Expected manager to stop without error")
 		})
 	})
 })
-
-func ignoreCanceled(err error) error {
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
-}
 
 // randomKubeconfig generates a kubeconfig file with n contexts and
 // writes it to the specified path.
@@ -155,12 +171,7 @@ func randomKubeconfig(n int, path string) ([]string, error) {
 
 	filler := randfill.New()
 	for i := 0; i < n; i++ {
-		var contextName string
-		ok := false
-		for !ok {
-			contextName, ok = randomKubeconfigContent(filler, cfg)
-		}
-		contextNames[i] = contextName
+		contextNames[i] = path + "+" + randomKubeconfigContent(filler, cfg)
 	}
 
 	if err := clientcmd.WriteToFile(*cfg, path); err != nil {
@@ -175,28 +186,32 @@ func randomString(filler *randfill.Filler, length int) string {
 	filler.Fill(&b)
 	// Otherwise we might end up with a string that contains invalid
 	// characters for a kubeconfig
-	return base64.URLEncoding.EncodeToString(b)
+	s := base64.URLEncoding.EncodeToString(b)
+	if s == "" {
+		return randomString(filler, length)
+	}
+	return s
 }
 
 // randomKubeconfigContent generates a random kubeconfig context, auth
 // info, and cluster, returning the context name a bool indicating
 // success.
-func randomKubeconfigContent(filler *randfill.Filler, cfg *clientcmdapi.Config) (string, bool) {
+func randomKubeconfigContent(filler *randfill.Filler, cfg *clientcmdapi.Config) string {
 	contextName := randomString(filler, 20)
 	if cfg.Contexts[contextName] != nil {
-		return "", false
+		return randomKubeconfigContent(filler, cfg)
 	}
 
 	authInfoName := randomString(filler, 20)
 	if cfg.AuthInfos[authInfoName] != nil {
-		return "", false
+		return randomKubeconfigContent(filler, cfg)
 	}
 	authInfo := clientcmdapi.NewAuthInfo()
 	authInfo.Token = randomString(filler, 64) // Ensure the token is a valid length
 
 	clusterName := randomString(filler, 20)
 	if cfg.Clusters[clusterName] != nil {
-		return "", false
+		return randomKubeconfigContent(filler, cfg)
 	}
 	cluster := clientcmdapi.NewCluster()
 	cluster.Server = randomString(filler, 120) + ":6443" // Append a port to make it look like a valid server address
@@ -210,5 +225,5 @@ func randomKubeconfigContent(filler *randfill.Filler, cfg *clientcmdapi.Config) 
 	cfg.Clusters[clusterName] = cluster
 	cfg.Contexts[contextName] = context
 
-	return contextName, true
+	return contextName
 }

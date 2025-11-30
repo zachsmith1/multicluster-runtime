@@ -21,16 +21,16 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 
-	mctrl "sigs.k8s.io/multicluster-runtime"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
-var _ mctrl.Manager = &wrappedManager{}
+var _ multicluster.Aware = &wrappedAware{}
 
-type wrappedManager struct {
-	mctrl.Manager
-	prefix, sep string
+type wrappedAware struct {
+	multicluster.Aware
+	providerName, sep string
 }
 
-func (w *wrappedManager) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
-	return w.Manager.Engage(ctx, w.prefix+w.sep+name, cl)
+func (w *wrappedAware) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
+	return w.Aware.Engage(ctx, w.providerName+w.sep+name, cl)
 }

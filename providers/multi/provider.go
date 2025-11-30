@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 
@@ -29,7 +31,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mctrl "sigs.k8s.io/multicluster-runtime"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
@@ -37,7 +38,22 @@ var _ multicluster.Provider = &Provider{}
 
 // Options defines the options for the provider.
 type Options struct {
+	// Separator is the string is used when concatenating a provider
+	// name and a cluster name.
+	// Default: "#"
+	// Example: "provider1#clusterA"
 	Separator string
+	// ChannelSize is the size of the internal channel used to
+	// notify the provider to start newly added providers. Shouldn't
+	// generally be needed unless many providers are added before
+	// starting the manager and/or the multi provider.
+	// Default: 10
+	ChannelSize int
+	// LoggerSuffix is an optional suffix to add to the logger name.
+	// This can be useful to distinguish multiple multi providers
+	// in the logs.
+	// Default: ""
+	LoggerSuffix string
 }
 
 // Provider is a multicluster.Provider that manages multiple providers.
@@ -45,11 +61,19 @@ type Provider struct {
 	opts Options
 
 	log logr.Logger
-	mgr mctrl.Manager
 
-	providerLock   sync.RWMutex
-	providers      map[string]multicluster.Provider
-	providerCancel map[string]context.CancelFunc
+	once            sync.Once
+	lock            sync.RWMutex
+	indexers        []index
+	providerNameCh  chan string
+	providers       map[string]multicluster.Provider
+	providersCancel map[string]context.CancelFunc
+}
+
+type index struct {
+	Object    client.Object
+	Field     string
+	Extractor client.IndexerFunc
 }
 
 // New returns a new instance of the provider with the given options.
@@ -60,21 +84,107 @@ func New(opts Options) *Provider {
 	if p.opts.Separator == "" {
 		p.opts.Separator = "#"
 	}
+	if p.opts.ChannelSize <= 0 {
+		p.opts.ChannelSize = 10
+	}
 
-	p.log = log.Log.WithName("multi-provider")
+	loggerName := "multi-provider"
+	if p.opts.LoggerSuffix != "" {
+		loggerName += "-" + p.opts.LoggerSuffix
+	}
+	p.log = log.Log.WithName(loggerName)
 
+	p.indexers = make([]index, 0)
 	p.providers = make(map[string]multicluster.Provider)
-	p.providerCancel = make(map[string]context.CancelFunc)
+	p.providersCancel = make(map[string]context.CancelFunc)
 
 	return p
 }
 
-// SetManager sets the manager for the provider.
-func (p *Provider) SetManager(mgr mctrl.Manager) {
-	if p.mgr != nil {
-		p.log.Error(nil, "manager already set, overwriting")
+// Start runs the provider. It runs all providers that implement
+// multicluster.ProviderRunnable, even those added after Start() has
+// been called.
+func (p *Provider) Start(ctx context.Context, aware multicluster.Aware) error {
+	p.once.Do(func() {
+		p.start(ctx, aware)
+	})
+	return nil
+}
+
+func (p *Provider) start(ctx context.Context, aware multicluster.Aware) {
+	p.log.Info("starting multi provider")
+
+	p.lock.Lock()
+	p.providerNameCh = make(chan string, p.opts.ChannelSize)
+	providerNames := slices.Collect(maps.Keys(p.providers))
+	p.lock.Unlock()
+
+	for _, providerName := range providerNames {
+		p.startProvider(ctx, providerName, aware)
 	}
-	p.mgr = mgr
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case providerName := <-p.providerNameCh:
+			p.startProvider(ctx, providerName, aware)
+		}
+	}
+}
+
+func (p *Provider) startProvider(ctx context.Context, providerName string, aware multicluster.Aware) {
+	p.log.Info("starting provider", "providerName", providerName)
+
+	p.lock.RLock()
+	provider, ok := p.providers[providerName]
+	p.lock.RUnlock()
+	if !ok {
+		p.log.Error(nil, "provider not found", "providerName", providerName)
+		return
+	}
+
+	runnable, ok := provider.(multicluster.ProviderRunnable)
+	if !ok {
+		p.log.Info("provider is not runnable, not starting", "providerName", providerName)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	wrappedAware := &wrappedAware{
+		Aware:        aware,
+		providerName: providerName,
+		sep:          p.opts.Separator,
+	}
+
+	p.lock.Lock()
+	if _, ok := p.providersCancel[providerName]; ok {
+		// This is a failsafe. It should never happen but on the off
+		// change that it somehow does the provider shouldn't be started
+		// twice.
+		cancel()
+		p.log.Error(nil, "provider already started, not starting again", "providerName", providerName)
+		p.lock.Unlock()
+		return
+	}
+	p.providersCancel[providerName] = cancel
+	p.lock.Unlock()
+
+	go func() {
+		defer p.RemoveProvider(providerName)
+		if err := runnable.Start(ctx, wrappedAware); err != nil {
+			p.log.Error(err, "error in provider", "providerName", providerName)
+		}
+	}()
+
+	p.lock.RLock()
+	for _, indexer := range p.indexers {
+		if err := provider.IndexField(ctx, indexer.Object, indexer.Field, indexer.Extractor); err != nil {
+			p.log.Error(err, "failed to apply indexer to provider", "providerName", providerName, "object", fmt.Sprintf("%T", indexer.Object), "field", indexer.Field)
+		}
+	}
+	p.lock.RUnlock()
 }
 
 func (p *Provider) splitClusterName(clusterName string) (string, string) {
@@ -85,7 +195,23 @@ func (p *Provider) splitClusterName(clusterName string) (string, string) {
 	return parts[0], parts[1]
 }
 
-// AddProvider adds a new provider with the given prefix.
+// ProviderNames returns the sorted list of prefixes for the
+// registered providers.
+func (p *Provider) ProviderNames() []string {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return slices.Sorted(maps.Keys(p.providers))
+}
+
+// GetProvider returns the provider for the given provider name.
+func (p *Provider) GetProvider(providerName string) (multicluster.Provider, bool) {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	provider, ok := p.providers[providerName]
+	return provider, ok
+}
+
+// AddProvider adds a new provider with the given provider name.
 //
 // The startFunc is called to start the provider - starting the provider
 // outside of startFunc is an error and will result in undefined
@@ -93,40 +219,21 @@ func (p *Provider) splitClusterName(clusterName string) (string, string) {
 // startFunc should block for as long as the provider is running,
 // If startFunc returns an error the provider is removed and the error
 // is returned.
-func (p *Provider) AddProvider(ctx context.Context, prefix string, provider multicluster.Provider, startFunc func(context.Context, mctrl.Manager) error) error {
-	ctx, cancel := context.WithCancel(ctx)
+func (p *Provider) AddProvider(providerName string, provider multicluster.Provider) error {
+	p.lock.Lock()
+	defer p.lock.Unlock()
 
-	p.providerLock.Lock()
-	_, ok := p.providers[prefix]
-	p.providerLock.Unlock()
+	_, ok := p.providers[providerName]
 	if ok {
-		cancel()
-		return fmt.Errorf("provider already exists for prefix %q", prefix)
+		return fmt.Errorf("provider already exists for provider name %q", providerName)
 	}
 
-	var wrappedMgr mctrl.Manager
-	if p.mgr == nil {
-		p.log.Info("manager is nil, wrapped manager passed to start will be nil as well", "prefix", prefix)
-	} else {
-		wrappedMgr = &wrappedManager{
-			Manager: p.mgr,
-			prefix:  prefix,
-			sep:     p.opts.Separator,
-		}
+	p.log.Info("adding provider", "providerName", providerName)
+
+	p.providers[providerName] = provider
+	if p.providerNameCh != nil {
+		p.providerNameCh <- providerName
 	}
-
-	p.providerLock.Lock()
-	p.providers[prefix] = provider
-	p.providerCancel[prefix] = cancel
-	p.providerLock.Unlock()
-
-	go func() {
-		defer p.RemoveProvider(prefix)
-		if err := startFunc(ctx, wrappedMgr); err != nil {
-			cancel()
-			p.log.Error(err, "error in provider", "prefix", prefix)
-		}
-	}()
 
 	return nil
 }
@@ -137,26 +244,34 @@ func (p *Provider) AddProvider(ctx context.Context, prefix string, provider mult
 // Warning: This can lead to dangling clusters if the provider is not
 // using the context it is started with to engage the clusters it
 // manages.
-func (p *Provider) RemoveProvider(prefix string) {
-	p.providerLock.Lock()
-	defer p.providerLock.Unlock()
-	if cancel, ok := p.providerCancel[prefix]; ok {
+func (p *Provider) RemoveProvider(providerName string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if cancel, ok := p.providersCancel[providerName]; ok {
 		cancel()
-		delete(p.providers, prefix)
-		delete(p.providerCancel, prefix)
+		delete(p.providersCancel, providerName)
 	}
+
+	if _, ok := p.providers[providerName]; !ok {
+		p.log.Info("provider not found when removing", "providerName", providerName)
+	}
+	delete(p.providers, providerName)
 }
 
 // Get returns a cluster by name.
-func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster, error) {
-	prefix, clusterName := p.splitClusterName(clusterName)
+func (p *Provider) Get(ctx context.Context, input string) (cluster.Cluster, error) {
+	providerName, clusterName := p.splitClusterName(input)
+	log := p.log.WithValues("providerName", providerName, "clusterName", clusterName)
+	log.V(1).Info("getting cluster")
 
-	p.providerLock.RLock()
-	provider, ok := p.providers[prefix]
-	p.providerLock.RUnlock()
+	p.lock.RLock()
+	provider, ok := p.providers[providerName]
+	p.lock.RUnlock()
 
 	if !ok {
-		return nil, fmt.Errorf("provider not found %q: %w", prefix, multicluster.ErrClusterNotFound)
+		log.Error(multicluster.ErrClusterNotFound, "provider not found")
+		return nil, fmt.Errorf("provider not found %q (%q): %w", providerName, input, multicluster.ErrClusterNotFound)
 	}
 
 	return provider.Get(ctx, clusterName)
@@ -165,14 +280,19 @@ func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster
 // IndexField indexes a field  on all providers and clusters and returns
 // the aggregated errors.
 func (p *Provider) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
-	p.providerLock.RLock()
-	defer p.providerLock.RUnlock()
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.indexers = append(p.indexers, index{
+		Object:    obj,
+		Field:     field,
+		Extractor: extractValue,
+	})
 	var errs error
-	for prefix, provider := range p.providers {
+	for providerName, provider := range p.providers {
 		if err := provider.IndexField(ctx, obj, field, extractValue); err != nil {
 			errs = errors.Join(
 				errs,
-				fmt.Errorf("failed to index field %q on cluster %q: %w", field, prefix, err),
+				fmt.Errorf("failed to index field %q on provider %q: %w", field, providerName, err),
 			)
 		}
 	}

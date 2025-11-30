@@ -127,6 +127,9 @@ type Runnable interface {
 
 var _ Manager = &mcManager{}
 
+// Option mutates mcManager configuration.
+type Option func(*mcManager)
+
 type mcManager struct {
 	manager.Manager
 	provider multicluster.Provider
@@ -249,6 +252,21 @@ func (m *mcManager) GetFieldIndexer() client.FieldIndexer {
 		}
 		return m.Manager.GetFieldIndexer().IndexField(ctx, obj, fieldName, indexerFunc)
 	})
+}
+
+// Start starts the manager. If the configured provider is also a ProviderRunnable,
+// it will be added as last runnable before starting the manager.
+func (m *mcManager) Start(ctx context.Context) error {
+	// if provider is a ProviderRunnable, add it as last runnable before starting.
+	if runnable, ok := m.GetProvider().(multicluster.ProviderRunnable); ok {
+		if err := m.Manager.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return runnable.Start(ctx, m)
+		})); err != nil {
+			return err
+		}
+	}
+
+	return m.Manager.Start(ctx)
 }
 
 var _ manager.Manager = &scopedManager{}

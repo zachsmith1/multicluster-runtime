@@ -28,21 +28,33 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
 var _ multicluster.Provider = &Provider{}
+var _ multicluster.ProviderRunnable = &Provider{}
+
+// Options contains the configuration for the kind provider.
+type Options struct {
+	// Prefix is an optional prefix applied to filter kind clusters by name.
+	Prefix string
+	// ClusterOptions is the list of options to pass to the cluster object.
+	ClusterOptions []cluster.Option
+	// RESTOptions is the list of options to pass to the rest client.
+	RESTOptions []func(cfg *rest.Config) error
+}
 
 // New creates a new kind cluster Provider.
-func New() *Provider {
+func New(opts Options) *Provider {
 	return &Provider{
+		opts:      opts,
 		log:       log.Log.WithName("kind-cluster-provider"),
 		clusters:  map[string]cluster.Cluster{},
 		cancelFns: map[string]context.CancelFunc{},
@@ -57,7 +69,9 @@ type index struct {
 
 // Provider is a cluster Provider that works with a local Kind instance.
 type Provider struct {
-	opts      []cluster.Option
+	mcAware multicluster.Aware
+
+	opts      Options
 	log       logr.Logger
 	lock      sync.RWMutex
 	clusters  map[string]cluster.Cluster
@@ -76,8 +90,10 @@ func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster
 	return nil, multicluster.ErrClusterNotFound
 }
 
-// Run starts the provider and blocks.
-func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
+// Start starts the provider and blocks.
+func (p *Provider) Start(ctx context.Context, mcAware multicluster.Aware) error {
+	p.mcAware = mcAware
+
 	p.log.Info("Starting kind cluster provider")
 
 	provider := kind.NewProvider()
@@ -99,7 +115,7 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 			log := p.log.WithValues("cluster", clusterName)
 
 			// skip?
-			if !strings.HasPrefix(clusterName, "fleet-") {
+			if p.opts.Prefix != "" && !strings.HasPrefix(clusterName, p.opts.Prefix) {
 				continue
 			}
 			p.lock.RLock()
@@ -120,7 +136,14 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 				p.log.Info("failed to create rest config", "error", err)
 				return false, nil // keep going
 			}
-			cl, err := cluster.New(cfg, p.opts...)
+			for _, opt := range p.opts.RESTOptions {
+				if err := opt(cfg); err != nil {
+					p.log.Info("failed to apply REST Options", "error", err)
+					return false, nil // keep going
+				}
+			}
+
+			cl, err := cluster.New(cfg, p.opts.ClusterOptions...)
 			if err != nil {
 				p.log.Info("failed to create cluster", "error", err)
 				return false, nil // keep going
@@ -152,15 +175,13 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 			p.log.Info("Added new cluster", "cluster", clusterName)
 
 			// engage manager
-			if mgr != nil {
-				if err := mgr.Engage(clusterCtx, clusterName, cl); err != nil {
-					log.Error(err, "failed to engage manager")
-					p.lock.Lock()
-					delete(p.clusters, clusterName)
-					delete(p.cancelFns, clusterName)
-					p.lock.Unlock()
-					return false, nil
-				}
+			if err := p.mcAware.Engage(clusterCtx, clusterName, cl); err != nil {
+				log.Error(err, "failed to engage manager")
+				p.lock.Lock()
+				delete(p.clusters, clusterName)
+				delete(p.cancelFns, clusterName)
+				p.lock.Unlock()
+				return false, nil
 			}
 		}
 

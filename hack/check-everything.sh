@@ -21,32 +21,24 @@ set -o pipefail
 hack_dir=$(dirname ${BASH_SOURCE})
 source ${hack_dir}/common.sh
 
-tmp_root=/tmp
+tmp_root=${TMPDIR:-/tmp}
 kb_root_dir=$tmp_root/kubebuilder
+examples_install_dir="${tmp_root}/mcr-examples"
 
 export GOTOOLCHAIN="go$(make go-version)"
 
 # Run verification scripts.
 ${hack_dir}/verify.sh
 
-# Envtest.
-ENVTEST_K8S_VERSION=${ENVTEST_K8S_VERSION:-"1.30.0"}
-
-header_text "installing envtest tools@${ENVTEST_K8S_VERSION} with setup-envtest if necessary"
-tmp_bin=/tmp/cr-tests-bin
-(
-    # don't presume to install for the user
-    GOBIN=${tmp_bin} go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.21
-)
-export KUBEBUILDER_ASSETS="$(${tmp_bin}/setup-envtest use --use-env -p path "${ENVTEST_K8S_VERSION}")"
-
 # Run tests.
 ${hack_dir}/test-all.sh
 
 header_text "confirming examples compile (via go install)"
+mkdir -p "$examples_install_dir"
 for EXAMPLE in $(ls examples); do
-    pushd examples/${EXAMPLE}; go install ${MOD_OPT} .; popd
+    pushd examples/${EXAMPLE}; GOBIN="$examples_install_dir" go install ${MOD_OPT} .; popd
 done
+rm -r "$examples_install_dir"
 
 echo "passed"
 exit 0
