@@ -70,7 +70,6 @@ var _ = Describe("Synchronization engine envtest (namespace provider)", func() {
 		defer cancel()
 
 		// Start manager and provider
-		go func() { _ = prov.Run(cctx, m) }()
 		go func() { _ = host.Start(cctx) }()
 		go func() { _ = m.Start(cctx) }()
 

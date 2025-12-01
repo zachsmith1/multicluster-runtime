@@ -106,7 +106,6 @@ func run(ctx context.Context) error {
 
 	// Start everything
 	g, ctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return ignoreCanceled(provider.Run(ctx, mgr)) })
 	g.Go(func() error { return ignoreCanceled(host.Start(ctx)) })
 	g.Go(func() error { return ignoreCanceled(mgr.Start(ctx)) })
 	return g.Wait()

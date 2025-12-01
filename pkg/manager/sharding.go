@@ -23,9 +23,6 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
 )
 
-// Option mutates mcManager configuration.
-type Option func(*mcManager)
-
 // WithSharder replaces the default HRW sharder.
 func WithSharder(s sharder.Sharder) Option {
 	return func(m *mcManager) {
