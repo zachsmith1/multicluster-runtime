@@ -1,4 +1,20 @@
-package manager
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sharded
 
 import (
 	"context"
@@ -14,7 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 )
 
 type stubSharder struct{ own bool }
@@ -39,33 +55,37 @@ func (s *stubRunnable) Engage(ctx context.Context, name string, cl cluster.Clust
 	return nil
 }
 
-func TestSynchronization_StartsWhenShouldOwnAndFenceAcquired(t *testing.T) {
+func TestCoordinator_StartsWhenShouldOwnAndFenceAcquired(t *testing.T) {
 	s := runtime.NewScheme()
 	if err := coordinationv1.AddToScheme(s); err != nil {
 		t.Fatalf("scheme: %v", err)
 	}
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
 
-	cfg := SynchronizationConfig{
+	cfg := Config{
 		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
 		LeaseDuration: 3 * time.Second, LeaseRenew: 50 * time.Millisecond, FenceThrottle: 50 * time.Millisecond,
 		PeerPrefix: "mcr-peer", PeerWeight: 1, Probe: 10 * time.Millisecond,
 	}
 	reg := &stubRegistry{self: sharder.PeerInfo{ID: "peer-0", Weight: 1}}
 	sh := &stubSharder{own: true}
-	e := newSynchronizationEngine(cli, logr.Discard(), sh, reg, reg.self, cfg)
+	c := New(cli, logr.Discard(),
+		withConfig(cfg),
+		WithPeerRegistry(reg),
+		WithSharder(sh),
+	)
 
 	sink := &stubRunnable{called: make(chan string, 1)}
-	e.AddRunnable(sink)
+	c.AddRunnable(sink)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := e.Engage(ctx, "zoo", nil); err != nil {
+	if err := c.Engage(ctx, "zoo", nil); err != nil {
 		t.Fatalf("engage: %v", err)
 	}
 	// Force a recompute to decide and start
-	e.recompute(ctx)
+	c.recompute(ctx)
 
 	select {
 	case name := <-sink.called:
@@ -78,7 +98,7 @@ func TestSynchronization_StartsWhenShouldOwnAndFenceAcquired(t *testing.T) {
 
 	// Verify Lease created and held by self
 	var ls coordinationv1.Lease
-	key := client.ObjectKey{Namespace: cfg.FenceNS, Name: e.fenceName("zoo")}
+	key := client.ObjectKey{Namespace: cfg.FenceNS, Name: c.fenceName("zoo")}
 	if err := cli.Get(ctx, key, &ls); err != nil {
 		t.Fatalf("get lease: %v", err)
 	}
@@ -87,41 +107,46 @@ func TestSynchronization_StartsWhenShouldOwnAndFenceAcquired(t *testing.T) {
 	}
 }
 
-func TestSynchronization_StopsAndReleasesWhenShouldOwnFalse(t *testing.T) {
+func TestCoordinator_StopsAndReleasesWhenShouldOwnFalse(t *testing.T) {
 	s := runtime.NewScheme()
 	if err := coordinationv1.AddToScheme(s); err != nil {
 		t.Fatalf("scheme: %v", err)
 	}
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
 
-	cfg := SynchronizationConfig{
+	cfg := Config{
 		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
 		LeaseDuration: 3 * time.Second, LeaseRenew: 50 * time.Millisecond, FenceThrottle: 50 * time.Millisecond,
 		PeerPrefix: "mcr-peer", PeerWeight: 1, Probe: 10 * time.Millisecond,
 	}
 	reg := &stubRegistry{self: sharder.PeerInfo{ID: "peer-0", Weight: 1}}
 	sh := &stubSharder{own: true}
-	e := newSynchronizationEngine(cli, logr.Discard(), sh, reg, reg.self, cfg)
+	c := New(cli, logr.Discard(),
+		withConfig(cfg),
+		WithPeerRegistry(reg),
+		WithSharder(sh),
+	)
 
-	e.AddRunnable(&stubRunnable{called: make(chan string, 1)})
+	c.AddRunnable(&stubRunnable{called: make(chan string, 1)})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := e.Engage(ctx, "zoo", nil); err != nil {
+	if err := c.Engage(ctx, "zoo", nil); err != nil {
 		t.Fatalf("engage: %v", err)
 	}
-	e.recompute(ctx) // start and acquire lease
+	// start and acquire lease
+	c.recompute(ctx)
 
-	// Flip ownership to false and recompute; engine should stop and release fence
+	// Flip ownership to false and recompute; coordinator should stop and release fence
 	sh.own = false
-	e.recompute(ctx)
+	c.recompute(ctx)
 
 	// Poll for lease holder cleared by Release()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		var ls coordinationv1.Lease
-		if err := cli.Get(ctx, client.ObjectKey{Namespace: cfg.FenceNS, Name: e.fenceName("zoo")}, &ls); err == nil {
+		if err := cli.Get(ctx, client.ObjectKey{Namespace: cfg.FenceNS, Name: c.fenceName("zoo")}, &ls); err == nil {
 			if ls.Spec.HolderIdentity != nil && *ls.Spec.HolderIdentity == "" {
 				return
 			}

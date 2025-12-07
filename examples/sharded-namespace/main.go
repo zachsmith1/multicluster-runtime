@@ -1,3 +1,19 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 // examples/sharded-namespace/main.go
 package main
 
@@ -14,12 +30,14 @@ import (
 	"k8s.io/klog/v2"
 
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	"sigs.k8s.io/multicluster-runtime/providers/namespace"
 )
@@ -51,15 +69,24 @@ func run(ctx context.Context) error {
 	}
 	provider := namespace.New(host)
 
+	// Direct client for coordinator (uses host scheme).
+	kubeClient, err := client.New(cfg, client.Options{Scheme: host.GetScheme()})
+	if err != nil {
+		return fmt.Errorf("create client: %w", err)
+	}
+
 	// Multicluster manager (no peer ID passed; pod hostname becomes peer ID).
 	// Configure sharding:
 	// - fencing prefix: "mcr-shard" (per-cluster Lease names become mcr-shard-<cluster>)
 	// - peer membership still uses "mcr-peer" internally (set in WithMultiCluster)
 	// Peer ID defaults to os.Hostname().
 	mgr, err := mcmanager.New(cfg, provider, manager.Options{},
-		mcmanager.WithShardLease("kube-system", "mcr-shard"),
-		// optional but explicit (your manager already defaults this to true)
-		mcmanager.WithPerClusterLease(true),
+		mcmanager.WithCoordinator(
+			sharded.New(kubeClient, ctrl.Log.WithName("sharded-coordinator"),
+				sharded.WithShardLease("kube-system", "mcr-shard"),
+				sharded.WithPerClusterLease(true),
+			),
+		),
 	)
 	if err != nil {
 		return fmt.Errorf("create mc manager: %w", err)

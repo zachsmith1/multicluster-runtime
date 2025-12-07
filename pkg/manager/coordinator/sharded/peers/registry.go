@@ -33,7 +33,7 @@ import (
 
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 	"sigs.k8s.io/multicluster-runtime/pkg/util"
 )
 

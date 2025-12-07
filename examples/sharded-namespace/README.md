@@ -112,14 +112,18 @@ In your example app (e.g., examples/sharded-namespace/main.go), configure fencin
 ```go
 mgr, err := mcmanager.New(cfg, provider, manager.Options{},
   // Per-cluster fencing Leases live here as mcr-shard-<namespace>
-  mcmanager.WithShardLease("kube-system", "mcr-shard"),
-  mcmanager.WithPerClusterLease(true), // enabled by default
+  mcmanager.WithCoordinator(
+    sharded.New(kubeClient, logr.Discard(),
+      sharded.WithShardLease("kube-system", "mcr-shard"),
+      sharded.WithPerClusterLease(true), // enabled by default
 
-  // Optional: tune fencing timings (duration, renew, throttle):
-  // mcmanager.WithLeaseTimings(30*time.Second, 10*time.Second, 750*time.Millisecond),
+      // Optional: tune fencing timings (duration, renew, throttle):
+      // sharded.WithLeaseTimings(30*time.Second, 10*time.Second, 750*time.Millisecond),
 
-  // Optional: peer weight for HRW:
-  // mcmanager.WithPeerWeight(1),
+      // Optional: peer weight for HRW:
+      // sharded.WithPeerWeight(1),
+    ),
+  ),
 )
 if err != nil {
   // handle error
