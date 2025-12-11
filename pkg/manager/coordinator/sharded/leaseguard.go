@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package manager
+package sharded
 
 import (
 	"context"
@@ -166,8 +166,8 @@ func (g *leaseGuard) renewOnce(ctx context.Context, key types.NamespacedName) bo
 	if ls.Spec.HolderIdentity != nil && *ls.Spec.HolderIdentity != g.id && !expired(&ls, now) {
 		return false
 	}
-	// update
 	ldurSec := int32(g.ldur / time.Second)
+	// update
 	ls.Spec.HolderIdentity = &g.id
 	ls.Spec.LeaseDurationSeconds = &ldurSec
 	ls.Spec.RenewTime = &now

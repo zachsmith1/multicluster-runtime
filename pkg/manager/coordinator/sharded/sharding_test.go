@@ -1,4 +1,20 @@
-package manager
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package sharded
 
 import (
 	"context"
@@ -12,7 +28,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 )
 
 type fakeRegistry struct{ p sharder.PeerInfo }
@@ -26,28 +42,27 @@ func TestOptions_ApplyPeerRegistry(t *testing.T) {
 	_ = coordinationv1.AddToScheme(s)
 	cli := fake.NewClientBuilder().WithScheme(s).Build()
 
-	cfg := SynchronizationConfig{}
 	reg := &fakeRegistry{p: sharder.PeerInfo{ID: "x", Weight: 7}}
-	eng := newSynchronizationEngine(cli, logr.Discard(), sharder.NewHRW(), reg, reg.Self(), cfg)
-	m := &mcManager{Manager: nil, provider: nil, engine: eng}
+	c := New(cli, logr.Discard())
 
-	WithPeerRegistry(reg)(m)
-	if m.engine.peers != reg {
+	WithPeerRegistry(reg)(c)
+	if c.peers != reg {
 		t.Fatalf("expected custom registry applied")
 	}
-	if m.engine.self != reg.Self() {
+	if c.self != reg.Self() {
 		t.Fatalf("expected self to be updated from registry")
 	}
 }
 
 func TestOptions_ApplyLeaseAndTimings(t *testing.T) {
-	m := &mcManager{engine: &synchronizationEngine{cfg: SynchronizationConfig{}}}
-	WithShardLease("ns", "name")(m)
-	WithPerClusterLease(true)(m)
-	WithLeaseTimings(30*time.Second, 10*time.Second, 750*time.Millisecond)(m)
-	WithSynchronizationIntervals(5*time.Second, 15*time.Second)(m)
+	c := New(nil, logr.Discard())
 
-	cfg := m.engine.cfg
+	WithShardLease("ns", "name")(c)
+	WithPerClusterLease(true)(c)
+	WithLeaseTimings(30*time.Second, 10*time.Second, 750*time.Millisecond)(c)
+	WithSynchronizationIntervals(5*time.Second, 15*time.Second)(c)
+
+	cfg := c.cfg
 	if cfg.FenceNS != "ns" || cfg.FencePrefix != "name" || !cfg.PerClusterLease {
 		t.Fatalf("lease cfg not applied: %+v", cfg)
 	}

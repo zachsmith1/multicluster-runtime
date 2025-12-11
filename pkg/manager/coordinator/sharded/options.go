@@ -14,20 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package manager
+package sharded
 
 import (
 	"time"
 
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/peers"
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/peers"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 )
 
 // WithSharder replaces the default HRW sharder.
 func WithSharder(s sharder.Sharder) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.sharder = s
+	return func(c *Coordinator) {
+		if s != nil {
+			c.sharder = s
 		}
 	}
 }
@@ -35,51 +35,40 @@ func WithSharder(s sharder.Sharder) Option {
 // WithPeerWeight allows heterogeneous peers (capacity hint).
 // Effective share tends toward w_i/Σw under many shards.
 func WithPeerWeight(w uint32) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.cfg.PeerWeight = w
-		}
+	return func(c *Coordinator) {
+		c.cfg.PeerWeight = w
 	}
 }
 
 // WithShardLease configures the fencing Lease ns/prefix (mcr-shard-* by default).
 func WithShardLease(ns, name string) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.cfg.FenceNS = ns
-			m.engine.cfg.FencePrefix = name
-		}
+	return func(c *Coordinator) {
+		c.cfg.FenceNS = ns
+		c.cfg.FencePrefix = name
 	}
 }
 
 // WithPerClusterLease enables/disables per-cluster fencing (true -> mcr-shard-<cluster>).
 func WithPerClusterLease(on bool) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.cfg.PerClusterLease = on
-		}
+	return func(c *Coordinator) {
+		c.cfg.PerClusterLease = on
 	}
 }
 
 // WithSynchronizationIntervals tunes the synchronization probe/rehash cadences.
 func WithSynchronizationIntervals(probe, rehash time.Duration) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.cfg.Probe = probe
-			m.engine.cfg.Rehash = rehash
-		}
+	return func(c *Coordinator) {
+		c.cfg.Probe = probe
+		c.cfg.Rehash = rehash
 	}
 }
 
 // WithLeaseTimings configures fencing lease timings.
-// Choose renew < duration (e.g., renew ≈ duration/3).
 func WithLeaseTimings(duration, renew, throttle time.Duration) Option {
-	return func(m *mcManager) {
-		if m.engine != nil {
-			m.engine.cfg.LeaseDuration = duration
-			m.engine.cfg.LeaseRenew = renew
-			m.engine.cfg.FenceThrottle = throttle
-		}
+	return func(c *Coordinator) {
+		c.cfg.LeaseDuration = duration
+		c.cfg.LeaseRenew = renew
+		c.cfg.FenceThrottle = throttle
 	}
 }
 
@@ -87,10 +76,17 @@ func WithLeaseTimings(duration, renew, throttle time.Duration) Option {
 // default Lease-based registry. Peer weight should be provided by the custom
 // registry; WithPeerWeight does not apply.
 func WithPeerRegistry(reg peers.Registry) Option {
-	return func(m *mcManager) {
-		if m.engine != nil && reg != nil {
-			m.engine.peers = reg
-			m.engine.self = reg.Self()
+	return func(c *Coordinator) {
+		if reg != nil {
+			c.peers = reg
+			c.self = reg.Self()
 		}
+	}
+}
+
+// withConfig replaces the full config (for tests only; not exported).
+func withConfig(cfg Config) Option {
+	return func(c *Coordinator) {
+		c.cfg = cfg
 	}
 }

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package manager
+package sharded
 
 import (
 	"context"
@@ -28,13 +28,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/peers"
-	"sigs.k8s.io/multicluster-runtime/pkg/manager/sharder"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/peers"
+	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	"sigs.k8s.io/multicluster-runtime/pkg/util"
 )
 
-// SynchronizationConfig holds the knobs for shard synchronization and fencing.
+// Config holds the knobs for shard synchronization and fencing.
 //
 // Fencing:
 //   - FenceNS/FencePrefix: namespace and name prefix for per-shard Lease objects
@@ -52,7 +52,7 @@ import (
 // Cadence:
 //   - Probe: periodic synchronization tick interval (decision loop).
 //   - Rehash: optional slower cadence for planned redistribution (unused in basic HRW).
-type SynchronizationConfig struct {
+type Config struct {
 	// FenceNS is the namespace where fence Leases live (usually "kube-system").
 	FenceNS string
 	// FencePrefix is the base Lease name for fences; with PerClusterLease it becomes
@@ -79,19 +79,22 @@ type SynchronizationConfig struct {
 	Rehash time.Duration
 }
 
-// synchronizationEngine makes synchronization decisions and starts/stops per-cluster work.
+// Option mutates a sharded Coordinator before use.
+type Option func(*Coordinator)
+
+// Coordinator makes synchronization decisions and starts/stops per-cluster work.
 //
 // It combines:
 //   - a peerRegistry (live peer snapshot),
 //   - a sharder (e.g., HRW) to decide "who should own",
 //   - a per-cluster leaseGuard to fence "who actually runs".
 //
-// The engine keeps per-cluster engagement state, ties watches/workers to an
+// The coordinator keeps per-cluster engagement state, ties watches/workers to an
 // engagement context, and uses the fence to guarantee single-writer semantics.
-type synchronizationEngine struct {
+type Coordinator struct {
 	// kube is the host cluster client used for Leases and provider operations.
 	kube client.Client
-	// log is the engine’s logger.
+	// log is the coordinator’s logger.
 	log logr.Logger
 	// sharder decides “shouldOwn” given clusterID, peers, and self (e.g., HRW).
 	sharder sharder.Sharder
@@ -100,7 +103,7 @@ type synchronizationEngine struct {
 	// self is this process’s identity/weight as known by the peer registry.
 	self sharder.PeerInfo
 	// cfg holds all synchronization/fencing configuration.
-	cfg SynchronizationConfig
+	cfg Config
 
 	// mu guards engaged and runnables.
 	mu sync.Mutex
@@ -110,7 +113,7 @@ type synchronizationEngine struct {
 	runnables []multicluster.Aware
 }
 
-// engagement tracks per-cluster lifecycle within the engine.
+// engagement tracks per-cluster lifecycle within the coordinator.
 //
 // ctx/cancel: engagement context; cancellation stops sources/workers.
 // started: whether runnables have been engaged for this cluster.
@@ -134,31 +137,53 @@ type engagement struct {
 	nextTry time.Time
 }
 
-// newSynchronizationEngine wires an engine with its dependencies and initial config.
-func newSynchronizationEngine(kube client.Client, log logr.Logger, shard sharder.Sharder, peers peers.Registry, self sharder.PeerInfo, cfg SynchronizationConfig) *synchronizationEngine {
-	return &synchronizationEngine{
-		kube: kube, log: log,
-		sharder: shard, peers: peers, self: self, cfg: cfg,
+// New returns a sharded Coordinator with defaults; options apply overrides.
+func New(kube client.Client, log logr.Logger, opts ...Option) *Coordinator {
+	c := &Coordinator{
+		kube:    kube,
+		log:     log,
+		cfg:     defaultConfig(),
+		sharder: sharder.NewHRW(),
 		engaged: make(map[string]*engagement),
+	}
+
+	for _, o := range opts {
+		o(c)
+	}
+
+	// Default peer registry if not injected.
+	if c.peers == nil {
+		c.peers = peers.NewLeaseRegistry(kube, c.cfg.FenceNS, c.cfg.PeerPrefix, "", c.cfg.PeerWeight, log)
+	}
+
+	c.self = c.peers.Self()
+	return c
+}
+
+func defaultConfig() Config {
+	return Config{
+		FenceNS: "kube-system", FencePrefix: "mcr-shard", PerClusterLease: true,
+		LeaseDuration: 20 * time.Second, LeaseRenew: 10 * time.Second, FenceThrottle: 750 * time.Millisecond,
+		PeerPrefix: "mcr-peer", PeerWeight: 1,
+		Probe: 5 * time.Second, Rehash: 15 * time.Second,
 	}
 }
 
-func (e *synchronizationEngine) fenceName(cluster string) string {
-	// Per-cluster fence: mcr-shard-<cluster>; otherwise a single global fence
-	if e.cfg.PerClusterLease {
-		return fmt.Sprintf("%s-%s", e.cfg.FencePrefix, util.SanitizeDNS1123(cluster))
+func (c *Coordinator) fenceName(cluster string) string {
+	if c.cfg.PerClusterLease {
+		return fmt.Sprintf("%s-%s", c.cfg.FencePrefix, util.SanitizeDNS1123(cluster))
 	}
-	return e.cfg.FencePrefix
+	return c.cfg.FencePrefix
 }
 
 // Runnable returns a Runnable that manages synchronization of clusters.
-func (e *synchronizationEngine) Runnable() manager.Runnable {
+func (c *Coordinator) Runnable() manager.Runnable {
 	return manager.RunnableFunc(func(ctx context.Context) error {
-		e.log.Info("synchronization runnable starting", "peer", e.self.ID)
+		c.log.Info("synchronization runnable starting", "peer", c.self.ID)
 		errCh := make(chan error, 1)
-		go func() { errCh <- e.peers.Run(ctx) }()
-		e.recompute(ctx)
-		t := time.NewTicker(e.cfg.Probe)
+		go func() { errCh <- c.peers.Run(ctx) }()
+		c.recompute(ctx)
+		t := time.NewTicker(c.cfg.Probe)
 		defer t.Stop()
 		for {
 			select {
@@ -167,26 +192,25 @@ func (e *synchronizationEngine) Runnable() manager.Runnable {
 			case err := <-errCh:
 				return err
 			case <-t.C:
-				e.log.V(1).Info("synchronization tick", "peers", len(e.peers.Snapshot()))
-				e.recompute(ctx)
+				c.log.V(1).Info("coordination tick", "peers", len(c.peers.Snapshot()))
+				c.recompute(ctx)
 			}
 		}
 	})
 }
 
-// Engage registers a cluster for synchronization management.
-func (e *synchronizationEngine) Engage(parent context.Context, name string, cl cluster.Cluster) error {
-	// If provider already canceled, don't engage a dead cluster.
+// Engage registers a cluster for coordination.
+func (c *Coordinator) Engage(parent context.Context, name string, cl cluster.Cluster) error {
 	if err := parent.Err(); err != nil {
 		return err
 	}
 
 	var doRecompute bool
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	if cur, ok := e.engaged[name]; ok {
+	if cur, ok := c.engaged[name]; ok {
 		// Re-engage same name: replace token; stop old engagement; preserve fence.
 		var fence *leaseGuard
 		if cur.fence != nil {
@@ -197,57 +221,56 @@ func (e *synchronizationEngine) Engage(parent context.Context, name string, cl c
 		}
 
 		newEng := &engagement{name: name, cl: cl, fence: fence}
-		e.engaged[name] = newEng
+		c.engaged[name] = newEng
 
 		// cleanup tied to the *new* token; old goroutine will no-op (ee != token)
 		go func(pctx context.Context, key string, token *engagement) {
 			<-pctx.Done()
-			e.mu.Lock()
-			if ee, ok := e.engaged[key]; ok && ee == token {
+			c.mu.Lock()
+			if ee, ok := c.engaged[key]; ok && ee == token {
 				if ee.started && ee.cancel != nil {
 					ee.cancel()
 				}
 				if ee.fence != nil {
 					go ee.fence.Release(context.Background())
 				}
-				delete(e.engaged, key)
+				delete(c.engaged, key)
 			}
-			e.mu.Unlock()
+			c.mu.Unlock()
 		}(parent, name, newEng)
 
 		doRecompute = true
 	} else {
 		eng := &engagement{name: name, cl: cl}
-		e.engaged[name] = eng
+		c.engaged[name] = eng
 		go func(pctx context.Context, key string, token *engagement) {
 			<-pctx.Done()
-			e.mu.Lock()
-			if ee, ok := e.engaged[key]; ok && ee == token {
+			c.mu.Lock()
+			if ee, ok := c.engaged[key]; ok && ee == token {
 				if ee.started && ee.cancel != nil {
 					ee.cancel()
 				}
 				if ee.fence != nil {
 					go ee.fence.Release(context.Background())
 				}
-				delete(e.engaged, key)
+				delete(c.engaged, key)
 			}
-			e.mu.Unlock()
+			c.mu.Unlock()
 		}(parent, name, eng)
 		doRecompute = true
 	}
 
 	// Kick a decision outside the lock for faster attach.
 	if doRecompute {
-		go e.recompute(parent)
+		go c.recompute(parent)
 	}
 
 	return nil
 }
 
-// recompute checks the current synchronization state and starts/stops clusters as needed.
-func (e *synchronizationEngine) recompute(parent context.Context) {
-	peers := e.peers.Snapshot()
-	self := e.self
+func (c *Coordinator) recompute(parent context.Context) {
+	peers := c.peers.Snapshot()
+	self := c.self
 
 	type toStart struct {
 		name string
@@ -259,10 +282,10 @@ func (e *synchronizationEngine) recompute(parent context.Context) {
 
 	now := time.Now()
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for name, engm := range e.engaged {
-		should := e.sharder.ShouldOwn(name, peers, self)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for name, engm := range c.engaged {
+		should := c.sharder.ShouldOwn(name, peers, self)
 
 		switch {
 		case should && !engm.started:
@@ -271,19 +294,19 @@ func (e *synchronizationEngine) recompute(parent context.Context) {
 				onLost := func(cluster string) func() {
 					return func() {
 						// best-effort stop if we lose the lease mid-flight
-						e.log.Info("lease lost; stopping", "cluster", cluster, "peer", self.ID)
-						e.mu.Lock()
-						if ee := e.engaged[cluster]; ee != nil && ee.started && ee.cancel != nil {
+						c.log.Info("lease lost; stopping", "cluster", cluster, "peer", self.ID)
+						c.mu.Lock()
+						if ee := c.engaged[cluster]; ee != nil && ee.started && ee.cancel != nil {
 							ee.cancel()
 							ee.started = false
 						}
-						e.mu.Unlock()
+						c.mu.Unlock()
 					}
 				}(name)
 				engm.fence = newLeaseGuard(
-					e.kube,
-					e.cfg.FenceNS, e.fenceName(name), e.self.ID,
-					e.cfg.LeaseDuration, e.cfg.LeaseRenew, onLost,
+					c.kube,
+					c.cfg.FenceNS, c.fenceName(name), c.self.ID,
+					c.cfg.LeaseDuration, c.cfg.LeaseRenew, onLost,
 				)
 			}
 
@@ -294,7 +317,7 @@ func (e *synchronizationEngine) recompute(parent context.Context) {
 
 			// try to take the fence; if we fail, set nextTry and retry on next tick
 			if !engm.fence.TryAcquire(parent) {
-				engm.nextTry = now.Add(e.cfg.FenceThrottle)
+				engm.nextTry = now.Add(c.cfg.FenceThrottle)
 				continue
 			}
 
@@ -302,7 +325,7 @@ func (e *synchronizationEngine) recompute(parent context.Context) {
 			ctx, cancel := context.WithCancel(parent)
 			engm.ctx, engm.cancel, engm.started = ctx, cancel, true
 			starts = append(starts, toStart{name: engm.name, cl: engm.cl, ctx: ctx})
-			e.log.Info("synchronization start", "cluster", name, "peer", self.ID)
+			c.log.Info("synchronization start", "cluster", name, "peer", self.ID)
 
 		case !should && engm.started:
 			// stop + release fence
@@ -315,34 +338,34 @@ func (e *synchronizationEngine) recompute(parent context.Context) {
 			engm.cancel = nil
 			engm.started = false
 			engm.nextTry = time.Time{}
-			e.log.Info("synchronization stop", "cluster", name, "peer", self.ID)
+			c.log.Info("synchronization stop", "cluster", name, "peer", self.ID)
 		}
 	}
 	for _, c := range stops {
 		c()
 	}
 	for _, s := range starts {
-		go e.startForCluster(s.ctx, s.name, s.cl)
+		go c.startForCluster(s.ctx, s.name, s.cl)
 	}
 }
 
-// startForCluster engages all runnables for the given cluster.
-func (e *synchronizationEngine) startForCluster(ctx context.Context, name string, cl cluster.Cluster) {
-	for _, r := range e.runnables {
+func (c *Coordinator) startForCluster(ctx context.Context, name string, cl cluster.Cluster) {
+	for _, r := range c.runnables {
 		if err := r.Engage(ctx, name, cl); err != nil {
-			e.log.Error(err, "failed to engage", "cluster", name)
+			c.log.Error(err, "failed to engage", "cluster", name)
 			// best-effort: cancel + mark stopped so next tick can retry
-			e.mu.Lock()
-			if engm := e.engaged[name]; engm != nil && engm.cancel != nil {
+			c.mu.Lock()
+			if engm := c.engaged[name]; engm != nil && engm.cancel != nil {
 				engm.cancel()
 				engm.started = false
 			}
-			e.mu.Unlock()
+			c.mu.Unlock()
 			return
 		}
 	}
 }
 
-func (e *synchronizationEngine) AddRunnable(r multicluster.Aware) {
-	e.runnables = append(e.runnables, r)
+// AddRunnable registers a multicluster-aware runnable.
+func (c *Coordinator) AddRunnable(r multicluster.Aware) {
+	c.runnables = append(c.runnables, r)
 }
