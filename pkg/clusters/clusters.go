@@ -111,15 +111,8 @@ func (c *Clusters[T]) Add(ctx context.Context, clusterName string, cl T, aware m
 		return err
 	}
 
-	// Engage before starting cache so handlers are registered for initial adds.
-	if aware != nil {
-		if err := aware.Engage(ctx, clusterName, cl); err != nil {
-			defer c.Remove(clusterName)
-			return err
-		}
-	}
-
-	// Start cluster after engagement and wait for cache sync.
+	// Start the cluster first. Informers guarantee that handlers added after Run
+	// receive a startup batch once the cache has synced.
 	go func() {
 		defer c.Remove(clusterName)
 		if err := cl.Start(ctx); err != nil {
@@ -129,12 +122,12 @@ func (c *Clusters[T]) Add(ctx context.Context, clusterName string, cl T, aware m
 		}
 	}()
 
-	waitCacheCtx, cancel := context.WithTimeout(ctx, c.WaitCacheTimeout)
-	defer cancel()
-
-	if !cl.GetCache().WaitForCacheSync(waitCacheCtx) {
-		defer c.Remove(clusterName)
-		return fmt.Errorf("timed out after %q waiting for cache to sync for cluster %s", c.WaitCacheTimeout, clusterName)
+	// Engage after starting. Initial events will be delivered once the cache syncs.
+	if aware != nil {
+		if err := aware.Engage(ctx, clusterName, cl); err != nil {
+			defer c.Remove(clusterName)
+			return err
+		}
 	}
 
 	c.lock.RLock()
