@@ -1,8 +1,8 @@
-package util
+package sanitize
 
-// SanitizeDNS1123 converts s to a DNS-1123 subdomain-compatible string for resource names.
+// DNS1123 converts s to a DNS-1123 subdomain-compatible string for resource names.
 // It lowercases, replaces unsupported characters with '-', and trims leading/trailing non-alphanumerics.
-func SanitizeDNS1123(s string) string {
+func DNS1123(s string) string {
 	b := make([]rune, 0, len(s))
 	for _, r := range s {
 		switch {

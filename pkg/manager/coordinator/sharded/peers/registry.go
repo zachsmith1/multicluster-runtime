@@ -34,7 +34,7 @@ import (
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
-	"sigs.k8s.io/multicluster-runtime/pkg/util"
+	"sigs.k8s.io/multicluster-runtime/pkg/util/sanitize"
 )
 
 const (
@@ -88,7 +88,7 @@ func NewLeaseRegistry(cli crclient.Client, ns, namePrefix string, selfID string,
 		}
 	}
 	// Sanitize to DNS-1123 subdomain for Lease names: lowercase, [a-z0-9-.], start/end alphanumeric.
-	selfID = util.SanitizeDNS1123(selfID)
+	selfID = sanitize.DNS1123(selfID)
 	if weight == 0 {
 		weight = defaultWeight
 	}

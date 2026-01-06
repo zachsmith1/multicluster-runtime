@@ -31,7 +31,7 @@ import (
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/peers"
 	"sigs.k8s.io/multicluster-runtime/pkg/manager/coordinator/sharded/sharder"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
-	"sigs.k8s.io/multicluster-runtime/pkg/util"
+	"sigs.k8s.io/multicluster-runtime/pkg/util/sanitize"
 )
 
 // Config holds the knobs for shard synchronization and fencing.
@@ -171,7 +171,7 @@ func defaultConfig() Config {
 
 func (c *Coordinator) fenceName(cluster string) string {
 	if c.cfg.PerClusterLease {
-		return fmt.Sprintf("%s-%s", c.cfg.FencePrefix, util.SanitizeDNS1123(cluster))
+		return fmt.Sprintf("%s-%s", c.cfg.FencePrefix, sanitize.DNS1123(cluster))
 	}
 	return c.cfg.FencePrefix
 }
